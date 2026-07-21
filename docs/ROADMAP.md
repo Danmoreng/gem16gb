@@ -10,6 +10,9 @@ Current stage: Milestone 1, checkpoint inspector and loader.
   quality-acceptable GGUFs for llama.cpp tiers B and C. Unpatched upstream conversion remains blocked.
 - Turn the verified text-only inventory into deterministic device-arena and context-profile plans after baseline
   setup is reproducible.
+- Use the retained direct vLLM characterization as a native-format performance reference. It is 1.66x–2.34x ahead
+  of the patched llama.cpp candidate in prefill and 1.25x–1.26x ahead in decode through 8K, but BF16 KV capacity,
+  timing-boundary differences, and autotuning fallbacks keep it from being an accepted parity baseline.
 
 ## Baseline gate
 

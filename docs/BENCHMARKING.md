@@ -24,3 +24,16 @@ power/clock/thermal telemetry remain open.
 The pinned SM120a competitor build is complete. Its NVFP4 object contains native block-scaled
 `OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X` instructions. This is a binary capability check only; runtime dispatch must
 still be captured with the selected model before a tier-B result is valid.
+
+## Direct vLLM development comparison
+
+A batch-one vLLM 0.25.1 characterization now loads the pinned Hugging Face checkpoint directly with native FP8
+attention weights, NVFP4 MLP weights, BF16 KV, CUDA Graphs, and no prefix caching or CPU offload. Across the common
+128-to-8K range, its median prefill result is 1.66x to 2.34x the patched llama.cpp candidate and its median steady
+decode result is 1.25x to 1.26x. These are not parity speedups: vLLM keeps FP8 attention while the GGUF maps those
+weights to BF16, and the prefill timing boundaries differ.
+
+The full table, methodology, raw samples, and limitations are under `benchmarks/baselines/vllm/`. In particular,
+vLLM reported capacity for 10,303 BF16 KV-cache tokens at 95% GPU-memory utilization, so this run cannot cover 32K
+or 65K. FlashInfer also used fallback tactics after some autotuning OOMs, including an untuned 8,192-token prefill
+shape. The characterization remains development evidence rather than an accepted baseline.
