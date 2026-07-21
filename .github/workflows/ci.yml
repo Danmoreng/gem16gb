@@ -31,6 +31,7 @@ jobs:
         run: |
           python3 -m py_compile \
             tools/compare_manifests.py \
+            tools/benchmark_vllm.py \
             tools/fetch_model.py \
             tools/generate_golden.py \
             tools/generate_llama_golden.py \
