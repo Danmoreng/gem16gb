@@ -4,9 +4,10 @@ Current stage: Milestone 1, checkpoint inspector and loader.
 
 ## Active gate
 
-- Capture tokens, selected hidden states, and logits from a trusted runtime that directly understands the pinned
-  compressed checkpoint.
-- Pin current upstream llama.cpp and prove or disprove closest-parity conversion for the same snapshot.
+- Extend the now-committed trusted vLLM token/top-logprob fixture with full-vocabulary logits and selected hidden
+  states.
+- Select and lock quality-acceptable GGUFs for llama.cpp tiers B and C; tier A is blocked by the pinned upstream
+  converter's rejection of the checkpoint's mixed compressed-tensors groups.
 - Turn the verified text-only inventory into deterministic device-arena and context-profile plans after baseline
   setup is reproducible.
 
@@ -15,7 +16,8 @@ Current stage: Milestone 1, checkpoint inspector and loader.
 The llama.cpp benchmark is deliberately before engine kernel optimization, but after source-checkpoint validation:
 
 1. The physical C++/Python manifest comparison must be exact. This is complete for all 1,389 tensors.
-2. A trusted direct-load runtime must produce fixed token IDs and reference logits.
+2. A trusted direct-load runtime must produce fixed token IDs and reference logits. Batch-one greedy token IDs and
+   top-20 log probabilities are now committed and reproduce exactly; full-vocabulary logits remain pending.
 3. The pinned llama.cpp converter must emit a tensor mapping report for the same source revision. Current upstream
    is pinned, but its converter rejects the checkpoint's mixed FP8/NVFP4 groups; this gate is explicitly blocked,
    not skipped.
@@ -25,8 +27,8 @@ The llama.cpp benchmark is deliberately before engine kernel optimization, but a
 
 ## Next milestones
 
-1. Establish the trusted reference runtime.
-2. Establish and pin the three llama.cpp baseline tiers.
+1. Establish and pin viable llama.cpp baseline tiers B and C while retaining the explicit tier-A converter block.
+2. Capture full-vocabulary reference logits and selected hidden states.
 3. Implement the memory planner and CPU reference operators with strict golden fixtures.
 4. Implement an unfused correctness engine.
 5. Add and disassemble native SM120a NVFP4 kernels.

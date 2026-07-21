@@ -17,8 +17,40 @@ layer; full-attention layers omit separate `v_proj` weight and scale tensors.
 
 ## Not yet established
 
-Operator tolerances, reference logits, generation agreement, and task quality have not been measured. Therefore
-`tests/tolerances.yaml` is intentionally empty. Tolerances will be added only after reference distributions exist.
+Operator tolerances, full-vocabulary logits, hidden-state comparisons, cross-engine generation agreement, and task
+quality have not been measured. Therefore `tests/tolerances.yaml` is intentionally empty. The committed vLLM
+fixture provides greedy token IDs and top-20 log probabilities, but it is not a substitute for full-logit Level 3
+metrics. Tolerances will be added only after reference distributions exist.
+
+## Direct reference runtime
+
+The checkpoint model card's reference recipe is used in a separate, ignored Python 3.13 environment. The first
+validated environment contains vLLM 0.25.1, PyTorch 2.11.0+cu130, Transformers 5.14.1, compressed-tensors 0.17.0,
+FlashInfer 0.6.13, and NVIDIA CUTLASS DSL 4.5.2. `tools/generate_golden.py` runs the locked local checkpoint with
+network access disabled, batch one, an 8K context limit, eager execution, no prefix cache, no CPU offload, and all
+multimodal limits set to zero. Model-supported chunked prefill remains enabled. It records exact templated prompt
+IDs, greedy output IDs, and the top 20 log
+probabilities at every generated position.
+
+Reference-runtime startup logs are part of the evidence: vLLM must select `CutlassFP8ScaledMMLinearKernel` for the
+attention projections and `FlashInferCutlassNvFp4LinearKernel` for the NVFP4 MLPs. Package selection alone does not
+replace later per-kernel profiling.
+
+Two consecutive runs on 2026-07-21 produced exactly identical prompt IDs, output IDs, and log probabilities. The
+first engine initialization took 119.44 seconds while compiling and autotuning; the warm-cache initialization took
+4.69 seconds. FlashInfer reported OOM for some autotuning tactics and stored default fallbacks for those shapes.
+This does not invalidate the correctness fixture, but it disqualifies these runs as performance evidence and must
+be revisited when configuring any vLLM speed baseline.
+
+Run with the reference environment activated so its `ninja` executable is visible:
+
+```bash
+PATH="$PWD/third_party/cache/unsloth-nvfp4-env/bin:$PATH" \
+  HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 VLLM_NO_USAGE_STATS=1 \
+  third_party/cache/unsloth-nvfp4-env/bin/python tools/generate_golden.py \
+  --model models/checkpoints/unsloth-gemma-4-12b-it-NVFP4-b1f6497 \
+  --output tests/golden/vllm-gemma4-12b-nvfp4.json
+```
 
 Reproduce the physical manifest comparison with:
 
