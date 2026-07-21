@@ -1,0 +1,47 @@
+{
+  "version": 8,
+  "cmakeMinimumRequired": { "major": 3, "minor": 28, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "host-debug",
+      "displayName": "Host debug and tests",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build/host-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "G4_ENABLE_CUDA": "OFF",
+        "G4_ENABLE_SANITIZERS": "OFF",
+        "G4_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "host-sanitize",
+      "displayName": "Host ASan and UBSan",
+      "inherits": "host-debug",
+      "binaryDir": "${sourceDir}/build/host-sanitize",
+      "cacheVariables": { "G4_ENABLE_SANITIZERS": "ON" }
+    },
+    {
+      "name": "rtx5080-release",
+      "displayName": "RTX 5080 release",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build/rtx5080-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "G4_ENABLE_CUDA": "ON",
+        "G4_CUDA_ARCHITECTURE": "120a",
+        "G4_BUILD_TESTS": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "host-debug", "configurePreset": "host-debug" },
+    { "name": "host-sanitize", "configurePreset": "host-sanitize" },
+    { "name": "rtx5080-release", "configurePreset": "rtx5080-release" }
+  ],
+  "testPresets": [
+    { "name": "host-debug", "configurePreset": "host-debug", "output": { "outputOnFailure": true } },
+    { "name": "host-sanitize", "configurePreset": "host-sanitize", "output": { "outputOnFailure": true } },
+    { "name": "rtx5080-release", "configurePreset": "rtx5080-release", "output": { "outputOnFailure": true } }
+  ]
+}

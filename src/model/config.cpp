@@ -1,0 +1,181 @@
+#include "model/config.h"
+
+#include <cmath>
+#include <fstream>
+#include <sstream>
+
+#include "util/json.h"
+
+namespace g4::internal {
+namespace {
+
+constexpr std::uint64_t kMaxConfigBytes = 16U * 1024U * 1024U;
+
+Result<std::string> ReadConfig(const std::filesystem::path& path) {
+  std::error_code error;
+  const auto size = std::filesystem::file_size(path, error);
+  if (error) {
+    return Status(StatusCode::kIoError, "cannot stat config: " + path.string() + ": " + error.message());
+  }
+  if (size > kMaxConfigBytes) {
+    return Status(StatusCode::kDataLoss, "config exceeds 16 MiB safety limit: " + path.string());
+  }
+  std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    return Status(StatusCode::kIoError, "cannot open config: " + path.string());
+  }
+  std::ostringstream contents;
+  contents << input.rdbuf();
+  if (!input.good() && !input.eof()) {
+    return Status(StatusCode::kIoError, "failed while reading config: " + path.string());
+  }
+  return contents.str();
+}
+
+const json::Value* Member(const json::Value& object, std::string_view name) {
+  return object.is_object() ? object.find(name) : nullptr;
+}
+
+const json::Value* Nested(const json::Value& root, std::string_view first, std::string_view second) {
+  const auto* parent = Member(root, first);
+  return parent == nullptr ? nullptr : Member(*parent, second);
+}
+
+std::string StringOrEmpty(const json::Value* value) {
+  return value != nullptr && value->is_string() ? value->as_string() : std::string{};
+}
+
+std::uint64_t UnsignedOrZero(const json::Value* value) {
+  if (value == nullptr || !value->is_integer() || value->as_integer() < 0) {
+    return 0;
+  }
+  return static_cast<std::uint64_t>(value->as_integer());
+}
+
+bool BoolOrFalse(const json::Value* value) {
+  return value != nullptr && value->is_bool() && value->as_bool();
+}
+
+std::vector<std::string> StringArray(const json::Value* value) {
+  std::vector<std::string> result;
+  if (value == nullptr || !value->is_array()) {
+    return result;
+  }
+  for (const auto& item : value->as_array()) {
+    if (item.is_string()) {
+      result.push_back(item.as_string());
+    }
+  }
+  return result;
+}
+
+double NumberOrZero(const json::Value* value) {
+  return value != nullptr && value->is_number() ? value->as_number() : 0.0;
+}
+
+Status ContractError(std::string field, std::string expected) {
+  return Status(StatusCode::kUnsupported, "unsupported primary checkpoint config: " + std::move(field) + " must be " + std::move(expected));
+}
+
+}  // namespace
+
+Result<ModelConfig> LoadModelConfig(const std::filesystem::path& path) {
+  auto text = ReadConfig(path);
+  if (!text.ok()) {
+    return text.status();
+  }
+  auto parsed = json::Parse(text.value(), {.max_depth = 128, .max_values = 100'000, .max_string_bytes = 8U * 1024U * 1024U});
+  if (!parsed.ok()) {
+    return Status(parsed.status().code(), path.string() + ": " + parsed.status().message());
+  }
+  const auto& root = parsed.value();
+  if (!root.is_object()) {
+    return Status(StatusCode::kDataLoss, "config root must be an object: " + path.string());
+  }
+
+  ModelConfig config;
+  const auto architectures = StringArray(Member(root, "architectures"));
+  if (!architectures.empty()) {
+    config.architecture = architectures.front();
+  }
+  config.model_type = StringOrEmpty(Member(root, "model_type"));
+  config.text_model_type = StringOrEmpty(Nested(root, "text_config", "model_type"));
+  config.hidden_size = UnsignedOrZero(Nested(root, "text_config", "hidden_size"));
+  config.intermediate_size = UnsignedOrZero(Nested(root, "text_config", "intermediate_size"));
+  config.layer_count = UnsignedOrZero(Nested(root, "text_config", "num_hidden_layers"));
+  config.vocabulary_size = UnsignedOrZero(Nested(root, "text_config", "vocab_size"));
+  config.max_positions = UnsignedOrZero(Nested(root, "text_config", "max_position_embeddings"));
+  config.sliding_window = UnsignedOrZero(Nested(root, "text_config", "sliding_window"));
+  config.query_heads = UnsignedOrZero(Nested(root, "text_config", "num_attention_heads"));
+  config.local_kv_heads = UnsignedOrZero(Nested(root, "text_config", "num_key_value_heads"));
+  config.global_kv_heads = UnsignedOrZero(Nested(root, "text_config", "num_global_key_value_heads"));
+  config.local_head_dimension = UnsignedOrZero(Nested(root, "text_config", "head_dim"));
+  config.global_head_dimension = UnsignedOrZero(Nested(root, "text_config", "global_head_dim"));
+  config.attention_k_eq_v = BoolOrFalse(Nested(root, "text_config", "attention_k_eq_v"));
+  config.tied_embeddings = BoolOrFalse(Nested(root, "text_config", "tie_word_embeddings"));
+  config.final_logit_softcap = NumberOrZero(Nested(root, "text_config", "final_logit_softcapping"));
+  config.layer_types = StringArray(Nested(root, "text_config", "layer_types"));
+
+  const auto* quantization = Member(root, "quantization_config");
+  if (quantization != nullptr && quantization->is_object()) {
+    config.quant_method = StringOrEmpty(Member(*quantization, "quant_method"));
+    config.quant_format = StringOrEmpty(Member(*quantization, "format"));
+    config.ignored_modules = StringArray(Member(*quantization, "ignore"));
+    const auto* groups = Member(*quantization, "config_groups");
+    if (groups != nullptr && groups->is_object()) {
+      for (const auto& [group_name, value] : groups->as_object()) {
+        if (!value.is_object()) {
+          return Status(StatusCode::kDataLoss, "quantization group is not an object: " + group_name);
+        }
+        QuantizationRule rule;
+        rule.group_name = group_name;
+        rule.format = StringOrEmpty(Member(value, "format"));
+        for (auto target : StringArray(Member(value, "targets"))) {
+          if (target.starts_with("re:")) {
+            rule.regex_targets.push_back(target.substr(3));
+          } else {
+            return Status(StatusCode::kUnsupported, "quantization target is not an explicit regex: " + target);
+          }
+        }
+        const auto* weights = Member(value, "weights");
+        const auto* activations = Member(value, "input_activations");
+        rule.weight_bits = static_cast<std::uint32_t>(UnsignedOrZero(weights == nullptr ? nullptr : Member(*weights, "num_bits")));
+        rule.activation_bits = static_cast<std::uint32_t>(UnsignedOrZero(activations == nullptr ? nullptr : Member(*activations, "num_bits")));
+        rule.group_size = static_cast<std::uint32_t>(UnsignedOrZero(weights == nullptr ? nullptr : Member(*weights, "group_size")));
+        rule.scale_dtype = StringOrEmpty(weights == nullptr ? nullptr : Member(*weights, "scale_dtype"));
+        rule.weight_strategy = StringOrEmpty(weights == nullptr ? nullptr : Member(*weights, "strategy"));
+        rule.activation_strategy = StringOrEmpty(activations == nullptr ? nullptr : Member(*activations, "strategy"));
+        const auto* dynamic = activations == nullptr ? nullptr : Member(*activations, "dynamic");
+        rule.activation_dynamic = dynamic != nullptr && dynamic->is_bool() && dynamic->as_bool();
+        rule.activation_dynamic_local = dynamic != nullptr && dynamic->is_string() && dynamic->as_string() == "local";
+        config.quantization_rules.push_back(std::move(rule));
+      }
+    }
+  }
+  return config;
+}
+
+Status ValidatePrimaryModelContract(const ModelConfig& config) {
+  if (config.architecture != "Gemma4UnifiedForConditionalGeneration") return ContractError("architecture", "Gemma4UnifiedForConditionalGeneration");
+  if (config.model_type != "gemma4_unified") return ContractError("model_type", "gemma4_unified");
+  if (config.text_model_type != "gemma4_unified_text") return ContractError("text_config.model_type", "gemma4_unified_text");
+  if (config.layer_count != 48) return ContractError("num_hidden_layers", "48");
+  if (config.hidden_size != 3840) return ContractError("hidden_size", "3840");
+  if (config.intermediate_size != 15360) return ContractError("intermediate_size", "15360");
+  if (config.query_heads != 16 || config.local_kv_heads != 8 || config.global_kv_heads != 1) return ContractError("attention head counts", "16 query / 8 local KV / 1 global KV");
+  if (config.local_head_dimension != 256 || config.global_head_dimension != 512) return ContractError("head dimensions", "256 local / 512 global");
+  if (config.sliding_window != 1024 || config.max_positions != 262144) return ContractError("context dimensions", "1024 sliding / 262144 maximum");
+  if (config.vocabulary_size != 262144) return ContractError("vocab_size", "262144");
+  if (!config.tied_embeddings || !config.attention_k_eq_v) return ContractError("tied embeddings and attention_k_eq_v", "true");
+  if (std::abs(config.final_logit_softcap - 30.0) > 1e-12) return ContractError("final_logit_softcapping", "30.0");
+  if (config.quant_method != "compressed-tensors" || config.quant_format != "mixed-precision") return ContractError("quantization schema", "compressed-tensors mixed-precision");
+  if (config.layer_types.size() != 48) return ContractError("layer_types length", "48");
+  for (std::size_t index = 0; index < config.layer_types.size(); ++index) {
+    const bool expected_global = (index % 6U) == 5U;
+    const std::string_view expected = expected_global ? "full_attention" : "sliding_attention";
+    if (config.layer_types[index] != expected) return ContractError("layer_types pattern", "five sliding layers followed by one full layer");
+  }
+  return Status::Ok();
+}
+
+}  // namespace g4::internal

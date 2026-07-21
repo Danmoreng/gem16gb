@@ -1,0 +1,13 @@
+/build*/
+/out/
+/.cache/
+/models/checkpoints/
+/benchmarks/results/*
+!/benchmarks/results/.gitkeep
+*.log
+*.prof
+*.nsys-rep
+*.ncu-rep
+__pycache__/
+*.py[cod]
+

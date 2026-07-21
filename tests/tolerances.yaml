@@ -1,0 +1,5 @@
+# Tolerances are intentionally empty until reference distributions exist.
+# Each future entry must name the operator, dtype path, metric, and evidence.
+schema_version: 1
+operators: {}
+

@@ -1,0 +1,32 @@
+name: host-ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  host:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Fetch exact source revision
+        env:
+          REPOSITORY: ${{ github.repository }}
+          REVISION: ${{ github.sha }}
+          SERVER: ${{ github.server_url }}
+        run: |
+          git init source
+          git -C source remote add origin "$SERVER/$REPOSITORY"
+          git -C source fetch --depth=1 origin "$REVISION"
+          git -C source checkout --detach FETCH_HEAD
+      - name: Configure
+        run: cmake --preset host-debug
+        working-directory: source
+      - name: Build
+        run: cmake --build --preset host-debug --parallel
+        working-directory: source
+      - name: Test
+        run: ctest --preset host-debug
+        working-directory: source
+      - name: Check Python tools
+        run: python3 -m py_compile tools/fetch_model.py tools/inspect_checkpoint.py
+        working-directory: source

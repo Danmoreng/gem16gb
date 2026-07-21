@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://g4.local/schemas/result.schema.json",
+  "title": "g4 benchmark result envelope",
+  "type": "object",
+  "required": ["schema_version", "status", "mode", "fallbacks"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "status": {"enum": ["ok", "not_implemented", "invalid"]},
+    "mode": {"enum": ["model-load", "prefill", "decode", "end-to-end", "kernel", "memory", "quality", "mtp"]},
+    "fallbacks": {"type": "integer", "minimum": 0}
+  },
+  "additionalProperties": true
+}
+

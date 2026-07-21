@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "repository": "unsloth/gemma-4-12b-it-NVFP4",
+  "revision": "b1f649734b34aa5575b03d186abd1b9be3d0d5c4",
+  "resolved_at_utc": "2026-07-21T18:07:34Z",
+  "model_card_revision": "ddf89cce51c143253e819998750d4adbc20ff0e6",
+  "config_revision": "cff080c927ba3783c002481be518cb17ec3372c6",
+  "tokenizer_revision": "cff080c927ba3783c002481be518cb17ec3372c6",
+  "files": [
+    {"path":".gitattributes","size":1570,"sha256":"34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930","git_oid":"52373fe24473b1aa44333d318f578ae6bf04b49b"},
+    {"path":"README.md","size":29820,"sha256":"9e2712c56330ea7eefc00a10fd3c37a63364b92e52f10e12266b01a3dc6a9887","git_oid":"f43dcf66ea657ff11cc683e53122b219bce2e8df"},
+    {"path":"chat_template.jinja","size":18924,"sha256":"845f1ee48e39fc942fe190da9df6a1c5db229e17a96ea08966ad1c9274e73d1b","git_oid":"e929d662bbbf430219c28133472e0956733a8f84"},
+    {"path":"config.json","size":7292,"sha256":"bcc0ec0398a9dd0b09586f835f17c05ed2cce99d958dd59ef629ce77e618ee49","git_oid":"895577e08537dbce788bdc7a9102bf85bea2e91f"},
+    {"path":"generation_config.json","size":255,"sha256":"801ecff5b38d5a5f5072cd1fb0ee03afabed577fb754518266fea69453acfe6b","git_oid":"b052ccdb6a742edb72bc98d7d7dd02f0c58e4680"},
+    {"path":"model.safetensors","size":9304966064,"sha256":"7c2ee23298e7c3a9247e8947597dca5a38f8b791a0322487466d2bfad8ce704b","git_oid":"65cbf46b3af2036a6146597d1bdbf925ba13b235","lfs_oid":"7c2ee23298e7c3a9247e8947597dca5a38f8b791a0322487466d2bfad8ce704b","xet_hash":"c00b747366c80104b80a44750efb592666d9df0c727193292e4b50ad3680948b"},
+    {"path":"processor_config.json","size":1382,"sha256":"6b938e76555b3e9946890770e1abcd442a4718f34041a58e8139dc8ad34545c9","git_oid":"b889adcd78015bf5a0139438c5fb0b7067529a61"},
+    {"path":"recipe.yaml","size":661,"sha256":"bb19ac4f3bf8c4ffb9b88701bef8faf06c679ae9461751cc849375bb1731c17b","git_oid":"c27417aceaf0637177e9d44c48ea59ccef873503"},
+    {"path":"tokenizer.json","size":32169726,"sha256":"adbaa8175acf7609b4359724f40eff359ec4fac1a8647eeb99d4422be708e1cf","git_oid":"03d63e59c9102f1ba39ef281fe2e24fa71d0eb1b","lfs_oid":"adbaa8175acf7609b4359724f40eff359ec4fac1a8647eeb99d4422be708e1cf","xet_hash":"233f0b992a852d6f1f9e030e23a1429f666a6d3c1e9be00ab0f2d63786768dd9"},
+    {"path":"tokenizer_config.json","size":2725,"sha256":"de3d45511a4ab7320083c0a4b65ec834fcf3d6c1027002714fceead12d2a6b86","git_oid":"7ee98d44536a5bf67852f4a9ce90ce7654399814"}
+  ]
+}
+
