@@ -6,7 +6,7 @@ Level 0 currently covers bounded JSON parsing, duplicate-key rejection, little-e
 shape-product overflow, known dtype byte sizes, payload bounds, exact byte lengths, overlapping ranges, duplicate
 tensors across shards, index agreement, UTF-8 strings, shard path traversal rejection, and symlink escape rejection.
 
-`g4-inspect --validate` additionally checks the expected primary architecture dimensions and quantization mode,
+`gem16gb-inspect --validate` additionally checks the expected primary architecture dimensions and quantization mode,
 then requires each classified NVFP4 packed weight to have local, global, and input scale tensors.
 
 An independent Python reader compares the raw Safetensors headers against the exported C++ manifest. For pinned
@@ -55,6 +55,6 @@ PATH="$PWD/third_party/cache/unsloth-nvfp4-env/bin:$PATH" \
 Reproduce the physical manifest comparison with:
 
 ```bash
-build/host-debug/bin/g4-inspect --model <checkpoint> --validate --json build/manifest.json
+build/host-debug/bin/gem16gb-inspect --model <checkpoint> --validate --json build/manifest.json
 python3 tools/compare_manifests.py --model <checkpoint> --manifest build/manifest.json
 ```

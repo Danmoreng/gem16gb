@@ -9,7 +9,7 @@ run_tests=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --cuda) preset="rtx5080-release" ;;
+    --cuda) preset="blackwell-release" ;;
     --host) preset="host-debug" ;;
     --sanitize) preset="host-sanitize" ;;
     --test) run_tests=true ;;

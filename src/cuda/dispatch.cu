@@ -3,11 +3,11 @@
 #include <sstream>
 #include <string>
 
-namespace g4::internal {
+namespace gem16gb::internal {
 
 std::string CudaCapabilityReport() {
   std::ostringstream output;
-  output << "compiled_architectures=" << G4_COMPILED_CUDA_ARCH << '\n';
+  output << "compiled_architectures=" << GEM16GB_COMPILED_CUDA_ARCH << '\n';
   int runtime_version = 0;
   int driver_version = 0;
   const cudaError_t runtime_status = cudaRuntimeGetVersion(&runtime_version);
@@ -34,4 +34,4 @@ std::string CudaCapabilityReport() {
   return output.str();
 }
 
-}  // namespace g4::internal
+}  // namespace gem16gb::internal

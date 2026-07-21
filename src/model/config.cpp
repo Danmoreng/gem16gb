@@ -6,7 +6,7 @@
 
 #include "util/json.h"
 
-namespace g4::internal {
+namespace gem16gb::internal {
 namespace {
 
 constexpr std::uint64_t kMaxConfigBytes = 16U * 1024U * 1024U;
@@ -178,4 +178,4 @@ Status ValidatePrimaryModelContract(const ModelConfig& config) {
   return Status::Ok();
 }
 
-}  // namespace g4::internal
+}  // namespace gem16gb::internal

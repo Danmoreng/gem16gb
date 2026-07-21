@@ -15,7 +15,7 @@
 
 #include "util/json.h"
 
-namespace g4::internal {
+namespace gem16gb::internal {
 namespace {
 
 constexpr std::uint64_t kMaxHeaderBytes = 256U * 1024U * 1024U;
@@ -280,4 +280,4 @@ Result<std::vector<StoredTensor>> LoadSafetensorsDirectory(const std::filesystem
   return result;
 }
 
-}  // namespace g4::internal
+}  // namespace gem16gb::internal

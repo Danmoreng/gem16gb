@@ -2,9 +2,8 @@
 
 #include <iosfwd>
 
-namespace g4 {
+namespace gem16gb {
 
 void PrintKernelCapabilities(std::ostream& output);
 
-}  // namespace g4
-
+}  // namespace gem16gb

@@ -7,9 +7,9 @@
 #include <variant>
 #include <vector>
 
-#include "g4/status.h"
+#include "gem16gb/status.h"
 
-namespace g4::json {
+namespace gem16gb::json {
 
 class Value {
  public:
@@ -48,5 +48,5 @@ struct ParseLimits {
 [[nodiscard]] Result<Value> Parse(std::string_view input, ParseLimits limits = {});
 [[nodiscard]] std::string Escape(std::string_view input);
 
-}  // namespace g4::json
+}  // namespace gem16gb::json
 

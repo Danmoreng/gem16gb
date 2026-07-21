@@ -33,31 +33,31 @@ void WriteSafetensors(const std::filesystem::path& path, std::string header, std
 }  // namespace
 
 void RunSafetensorsTests() {
-  const auto root = std::filesystem::temp_directory_path() / ("g4-safetensors-test-" + std::to_string(getpid()));
+  const auto root = std::filesystem::temp_directory_path() / ("gem16gb-safetensors-test-" + std::to_string(getpid()));
   std::error_code error;
   std::filesystem::remove_all(root, error);
   std::filesystem::create_directories(root);
 
   WriteSafetensors(root / "model.safetensors",
                    R"({"a":{"dtype":"U8","shape":[4],"data_offsets":[0,4]},"b":{"dtype":"BF16","shape":[2],"data_offsets":[4,8]}})", 8);
-  auto valid = g4::internal::LoadSafetensorsDirectory(root);
-  G4_CHECK(valid.ok());
+  auto valid = gem16gb::internal::LoadSafetensorsDirectory(root);
+  GEM16GB_CHECK(valid.ok());
   if (valid.ok()) {
-    G4_CHECK(valid.value().size() == 2);
-    G4_CHECK(valid.value()[0].name == "a");
-    G4_CHECK(valid.value()[1].length == 4);
+    GEM16GB_CHECK(valid.value().size() == 2);
+    GEM16GB_CHECK(valid.value()[0].name == "a");
+    GEM16GB_CHECK(valid.value()[1].length == 4);
   }
 
   WriteSafetensors(root / "model.safetensors",
                    R"({"a":{"dtype":"U8","shape":[4],"data_offsets":[0,4]},"b":{"dtype":"U8","shape":[4],"data_offsets":[2,6]}})", 6);
-  G4_CHECK(!g4::internal::LoadSafetensorsDirectory(root).ok());
+  GEM16GB_CHECK(!gem16gb::internal::LoadSafetensorsDirectory(root).ok());
 
   std::filesystem::remove(root / "model.safetensors");
   {
     std::ofstream index(root / "model.safetensors.index.json");
     index << R"({"weight_map":{"a":"../escape.safetensors"}})";
   }
-  G4_CHECK(!g4::internal::LoadSafetensorsDirectory(root).ok());
+  GEM16GB_CHECK(!gem16gb::internal::LoadSafetensorsDirectory(root).ok());
 
   const auto external = root.parent_path() / (root.filename().string() + "-external.safetensors");
   WriteSafetensors(external, R"({"a":{"dtype":"U8","shape":[4],"data_offsets":[0,4]}})", 4);
@@ -66,11 +66,11 @@ void RunSafetensorsTests() {
     index << R"({"weight_map":{"a":"linked.safetensors"}})";
   }
   std::filesystem::create_symlink(external, root / "linked.safetensors", error);
-  G4_CHECK(!error);
-  G4_CHECK(!g4::internal::LoadSafetensorsDirectory(root).ok());
+  GEM16GB_CHECK(!error);
+  GEM16GB_CHECK(!gem16gb::internal::LoadSafetensorsDirectory(root).ok());
 
   std::filesystem::remove_all(root, error);
-  G4_CHECK(!error);
+  GEM16GB_CHECK(!error);
   std::filesystem::remove(external, error);
-  G4_CHECK(!error);
+  GEM16GB_CHECK(!error);
 }

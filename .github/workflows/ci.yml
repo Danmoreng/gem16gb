@@ -29,6 +29,13 @@ jobs:
         working-directory: source
       - name: Check Python tools
         run: |
-          python3 -m py_compile tools/fetch_model.py tools/inspect_checkpoint.py tools/compare_manifests.py tools/generate_golden.py
+          python3 -m py_compile \
+            tools/compare_manifests.py \
+            tools/fetch_model.py \
+            tools/generate_golden.py \
+            tools/generate_llama_golden.py \
+            tools/inspect_checkpoint.py \
+            tools/inspect_gguf.py \
+            tools/summarize_llama_bench.py
           python3 -m unittest discover -s tests/python -v
         working-directory: source

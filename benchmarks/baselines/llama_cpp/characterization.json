@@ -1,0 +1,384 @@
+{
+  "status": "development_characterization_not_accepted_baseline",
+  "label": "same-source-closest-parity-patched",
+  "hardware_class": "Blackwell CUDA GPU, approximately 16 GB",
+  "source_files": [
+    "benchmarks/results/2026-07-21/ffb8e89/blackwell16gb-reference/llama_cpp/prefill-short.json",
+    "benchmarks/results/2026-07-21/ffb8e89/blackwell16gb-reference/llama_cpp/prefill-long.json",
+    "benchmarks/results/2026-07-21/ffb8e89/blackwell16gb-reference/llama_cpp/decode-short.json"
+  ],
+  "engine": {
+    "build_commit": "846e991e",
+    "build_number": 10083,
+    "backend": "CUDA",
+    "model_sha256": "e4910e01c4275e58acbf2c38c4d4fb81acf61bb8aa04eed121eb5ac942705e8a",
+    "kv_type_k": "bf16",
+    "kv_type_v": "bf16",
+    "flash_attention": true,
+    "gpu_layers": 99,
+    "cpu_moe_layers": 0,
+    "batch_size": 2048,
+    "micro_batch_size": 512,
+    "threads": 16
+  },
+  "methodology": {
+    "conditioning_repetitions": 3,
+    "measured_repetitions": 10,
+    "primary_statistic": "median",
+    "confidence_interval": "two-sided 95% Student t interval around the arithmetic mean",
+    "prompt_cache_reuse": false
+  },
+  "results": [
+    {
+      "mode": "prefill",
+      "prompt_tokens": 128,
+      "generated_tokens": 0,
+      "existing_context_tokens": 0,
+      "throughput_tokens_per_second": {
+        "sample_count": 10,
+        "mean": 2190.074,
+        "median": 2214.7,
+        "standard_deviation": 85.45599753999453,
+        "minimum": 1949.88,
+        "maximum": 2239.62,
+        "confidence_interval_95": [
+          2128.9467091013335,
+          2251.2012908986667
+        ],
+        "samples": [
+          1949.88,
+          2204.59,
+          2213.38,
+          2219.87,
+          2233.01,
+          2210.53,
+          2239.62,
+          2216.02,
+          2221.62,
+          2192.22
+        ]
+      }
+    },
+    {
+      "mode": "prefill",
+      "prompt_tokens": 512,
+      "generated_tokens": 0,
+      "existing_context_tokens": 0,
+      "throughput_tokens_per_second": {
+        "sample_count": 10,
+        "mean": 2590.801,
+        "median": 2628.27,
+        "standard_deviation": 316.7895448418573,
+        "minimum": 2033.53,
+        "maximum": 2942.88,
+        "confidence_interval_95": [
+          2364.199155557875,
+          2817.4028444421247
+        ],
+        "samples": [
+          2337.5,
+          2846.95,
+          2942.88,
+          2662.05,
+          2033.53,
+          2533.65,
+          2858.5,
+          2906.61,
+          2594.49,
+          2191.85
+        ]
+      }
+    },
+    {
+      "mode": "prefill",
+      "prompt_tokens": 2048,
+      "generated_tokens": 0,
+      "existing_context_tokens": 0,
+      "throughput_tokens_per_second": {
+        "sample_count": 10,
+        "mean": 2537.611,
+        "median": 2539.06,
+        "standard_deviation": 21.16884841774191,
+        "minimum": 2501.1,
+        "maximum": 2570.48,
+        "confidence_interval_95": [
+          2522.468770168612,
+          2552.7532298313877
+        ],
+        "samples": [
+          2531.73,
+          2501.1,
+          2508.73,
+          2542.56,
+          2570.48,
+          2562.56,
+          2543.55,
+          2534.73,
+          2535.56,
+          2545.11
+        ]
+      }
+    },
+    {
+      "mode": "prefill",
+      "prompt_tokens": 8192,
+      "generated_tokens": 0,
+      "existing_context_tokens": 0,
+      "throughput_tokens_per_second": {
+        "sample_count": 10,
+        "mean": 2359.807,
+        "median": 2361.915,
+        "standard_deviation": 11.7449233004449,
+        "minimum": 2338.79,
+        "maximum": 2378.61,
+        "confidence_interval_95": [
+          2351.4057717206992,
+          2368.2082282793003
+        ],
+        "samples": [
+          2378.61,
+          2371.44,
+          2365.95,
+          2360.6,
+          2363.23,
+          2363.72,
+          2356.77,
+          2352.87,
+          2346.09,
+          2338.79
+        ]
+      }
+    },
+    {
+      "mode": "prefill",
+      "prompt_tokens": 32768,
+      "generated_tokens": 0,
+      "existing_context_tokens": 0,
+      "throughput_tokens_per_second": {
+        "sample_count": 10,
+        "mean": 1907.015,
+        "median": 1904.2,
+        "standard_deviation": 11.245939761136484,
+        "minimum": 1895.89,
+        "maximum": 1928.48,
+        "confidence_interval_95": [
+          1898.9706982424068,
+          1915.0593017575934
+        ],
+        "samples": [
+          1928.48,
+          1921.62,
+          1914.16,
+          1908.69,
+          1905.49,
+          1902.91,
+          1899.17,
+          1896.91,
+          1895.89,
+          1896.83
+        ]
+      }
+    },
+    {
+      "mode": "prefill",
+      "prompt_tokens": 65536,
+      "generated_tokens": 0,
+      "existing_context_tokens": 0,
+      "throughput_tokens_per_second": {
+        "sample_count": 10,
+        "mean": 1469.505,
+        "median": 1469.3000000000002,
+        "standard_deviation": 1.1746701664722252,
+        "minimum": 1468.39,
+        "maximum": 1472.37,
+        "confidence_interval_95": [
+          1468.6647499643916,
+          1470.3452500356086
+        ],
+        "samples": [
+          1472.37,
+          1468.39,
+          1469.2,
+          1468.84,
+          1469.4,
+          1469.61,
+          1469.67,
+          1470.34,
+          1468.84,
+          1468.39
+        ]
+      }
+    },
+    {
+      "mode": "decode",
+      "prompt_tokens": 0,
+      "generated_tokens": 256,
+      "existing_context_tokens": 128,
+      "throughput_tokens_per_second": {
+        "sample_count": 10,
+        "mean": 29.70714,
+        "median": 29.66885,
+        "standard_deviation": 0.26120960591490944,
+        "minimum": 29.3907,
+        "maximum": 30.2526,
+        "confidence_interval_95": [
+          29.520294886421937,
+          29.89398511357806
+        ],
+        "samples": [
+          29.765,
+          30.2526,
+          29.9251,
+          29.871,
+          29.7399,
+          29.5831,
+          29.4538,
+          29.3907,
+          29.4924,
+          29.5978
+        ]
+      },
+      "aggregate_time_per_token_ms": {
+        "sample_count": 10,
+        "mean": 33.66424272226563,
+        "median": 33.70557191601563,
+        "standard_deviation": 0.29415974655304244,
+        "minimum": 33.0550245703125,
+        "maximum": 34.0243297734375,
+        "confidence_interval_95": [
+          33.45382813562634,
+          33.874657308904915
+        ],
+        "samples": [
+          33.59647729296875,
+          33.0550245703125,
+          33.416711234375,
+          33.4772388671875,
+          33.62485368359375,
+          33.80308354296875,
+          33.95143039453125,
+          34.0243297734375,
+          33.90698771484375,
+          33.7862901484375
+        ]
+      },
+      "latency_limitation": "llama-bench reports aggregate generation time, not an inter-token latency distribution"
+    },
+    {
+      "mode": "decode",
+      "prompt_tokens": 0,
+      "generated_tokens": 256,
+      "existing_context_tokens": 2048,
+      "throughput_tokens_per_second": {
+        "sample_count": 10,
+        "mean": 28.83605,
+        "median": 28.87415,
+        "standard_deviation": 0.14438682034344025,
+        "minimum": 28.471,
+        "maximum": 29.0106,
+        "confidence_interval_95": [
+          28.732769066851496,
+          28.939330933148504
+        ],
+        "samples": [
+          28.471,
+          28.7626,
+          28.8095,
+          28.8771,
+          28.9077,
+          28.8401,
+          28.8975,
+          29.0106,
+          28.8712,
+          28.9132
+        ]
+      },
+      "aggregate_time_per_token_ms": {
+        "sample_count": 10,
+        "mean": 34.6796002734375,
+        "median": 34.63308962890625,
+        "standard_deviation": 0.17501631221844788,
+        "minimum": 34.47019483984375,
+        "maximum": 35.1234065,
+        "confidence_interval_95": [
+          34.55440984401232,
+          34.80479070286268
+        ],
+        "samples": [
+          35.1234065,
+          34.76733320703125,
+          34.71080898046875,
+          34.62953026171875,
+          34.59280184765625,
+          34.67398749609375,
+          34.6050413125,
+          34.47019483984375,
+          34.63664899609375,
+          34.58624929296875
+        ]
+      },
+      "latency_limitation": "llama-bench reports aggregate generation time, not an inter-token latency distribution"
+    },
+    {
+      "mode": "decode",
+      "prompt_tokens": 0,
+      "generated_tokens": 256,
+      "existing_context_tokens": 8192,
+      "throughput_tokens_per_second": {
+        "sample_count": 10,
+        "mean": 28.09399,
+        "median": 28.078650000000003,
+        "standard_deviation": 0.045565836373805714,
+        "minimum": 28.0222,
+        "maximum": 28.1764,
+        "confidence_interval_95": [
+          28.061396428861134,
+          28.12658357113887
+        ],
+        "samples": [
+          28.0222,
+          28.0631,
+          28.0965,
+          28.0756,
+          28.1764,
+          28.0817,
+          28.1464,
+          28.0713,
+          28.1338,
+          28.0729
+        ]
+      },
+      "aggregate_time_per_token_ms": {
+        "sample_count": 10,
+        "mean": 35.59488243007812,
+        "median": 35.614254890625006,
+        "standard_deviation": 0.057675205569535065,
+        "minimum": 35.49072962109375,
+        "maximum": 35.6859633828125,
+        "confidence_interval_95": [
+          35.553626939884595,
+          35.63613792027165
+        ],
+        "samples": [
+          35.6859633828125,
+          35.63393183203125,
+          35.59162691015625,
+          35.61809738671875,
+          35.49072962109375,
+          35.61041239453125,
+          35.52853611328125,
+          35.62353871875,
+          35.544438421875,
+          35.62154951953125
+        ]
+      },
+      "latency_limitation": "llama-bench reports aggregate generation time, not an inter-token latency distribution"
+    }
+  ],
+  "open_gates": [
+    "quality acceptance threshold",
+    "profiler-level native NVFP4 invocation trace",
+    "per-token latency distribution",
+    "power, clock, and thermal time series"
+  ]
+}

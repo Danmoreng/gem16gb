@@ -4,7 +4,7 @@
 #include <string>
 #include <vector>
 
-namespace g4 {
+namespace gem16gb {
 
 struct TensorInfo {
   std::string name;
@@ -42,5 +42,4 @@ struct ModelManifest {
   std::uint64_t skipped_tensor_bytes = 0;
 };
 
-}  // namespace g4
-
+}  // namespace gem16gb

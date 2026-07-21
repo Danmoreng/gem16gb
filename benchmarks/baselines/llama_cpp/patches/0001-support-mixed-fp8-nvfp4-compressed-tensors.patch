@@ -1,0 +1,55 @@
+diff --git a/conversion/base.py b/conversion/base.py
+index 1b85ef0a..2a5edfe2 100644
+--- a/conversion/base.py
++++ b/conversion/base.py
+@@ -481,0 +482,3 @@ class ModelBase:
++                group_formats = {
++                    g.get("format") for g in groups.values() if isinstance(g, dict)
++                }
+@@ -486 +489,5 @@ class ModelBase:
+-                    and all(g.get("format") == "nvfp4-pack-quantized" for g in groups.values() if isinstance(g, dict))
++                    and "nvfp4-pack-quantized" in group_formats
++                )
++                supported_mixed_nvfp4 = (
++                    nvfp4_compressed_tensors
++                    and group_formats <= {"float-quantized", "nvfp4-pack-quantized"}
+@@ -489 +496 @@ class ModelBase:
+-                if len(groups) > 1 and not nvfp4_compressed_tensors:
++                if len(groups) > 1 and not supported_mixed_nvfp4:
+@@ -535,2 +542,25 @@ class ModelBase:
+-                    # Don't error from compressed-tensors, we'll handle them in _generate_nvfp4_tensors
+-                    pass
++                    # NVFP4 tensors have already been written and removed by
++                    # _generate_nvfp4_tensors. Dequantize any remaining FP8
++                    # tensors from a supported mixed-precision group.
++                    fp8_groups = [g for g in groups.values() if g.get("format") == "float-quantized"]
++                    if fp8_groups:
++                        if len(fp8_groups) != 1:
++                            raise NotImplementedError("Multiple float-quantized groups are not supported")
++                        fp8_weight_config = fp8_groups[0]["weights"]
++                        block_size = fp8_weight_config.get("block_structure", None)
++                        strategy = fp8_weight_config.get("strategy")
++                        assert strategy == "channel" or strategy == "block"
++                        assert fp8_weight_config.get("group_size") is None
++                        is_fp8 = (
++                            fp8_weight_config.get("type") == "float"
++                            and fp8_weight_config.get("num_bits") == 8
++                        )
++                        for name in self.model_tensors.keys():
++                            if name.endswith(".weight_scale"):
++                                weight_name = name.removesuffix("_scale")
++                                w = self.model_tensors[weight_name]
++                                s = self.model_tensors[name]
++                                self.model_tensors[weight_name] = lambda w=w, s=s: dequant_simple(w(), s(), block_size)
++                                tensors_to_remove.append(name)
++                                if self._fp8_as_q8 and is_fp8:
++                                    self._fp8_dequantized.add(weight_name)
+@@ -711,2 +741,3 @@ class ModelBase:
+-            # Skip non-NVFP4 tensors (e.g. FP8 with per-channel 1D scales)
+-            if scale.ndim < 2:
++            # Packed NVFP4 weights use byte storage. Skip non-NVFP4 tensors;
++            # FP8 per-channel scales may be either 1D or [out_features, 1].
++            if weight.dtype != torch.uint8:
+@@ -818 +849 @@ class ModelBase:
+-            and all(g.get("format") == "nvfp4-pack-quantized" for g in quant_groups.values() if isinstance(g, dict))
++            and any(g.get("format") == "nvfp4-pack-quantized" for g in quant_groups.values() if isinstance(g, dict))

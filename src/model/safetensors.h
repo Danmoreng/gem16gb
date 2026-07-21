@@ -5,9 +5,9 @@
 #include <string>
 #include <vector>
 
-#include "g4/status.h"
+#include "gem16gb/status.h"
 
-namespace g4::internal {
+namespace gem16gb::internal {
 
 struct StoredTensor {
   std::string name;
@@ -21,5 +21,5 @@ struct StoredTensor {
 
 [[nodiscard]] Result<std::vector<StoredTensor>> LoadSafetensorsDirectory(const std::filesystem::path& model_directory);
 
-}  // namespace g4::internal
+}  // namespace gem16gb::internal
 

@@ -3,12 +3,12 @@
 ## 2026-07-21: Keep CUDA opt-in during repository initialization
 
 Date: 2026-07-21  
-Decision: Provide separate host-debug and RTX-5080 CUDA presets. Do not label the CUDA runtime probe as a native
+Decision: Provide separate host-debug and Blackwell CUDA presets. Do not label the CUDA runtime probe as a native
 kernel path.  
 Context: Parser and manifest work must build on machines without CUDA, while performance builds must remain
 architecture-specific.  
 Alternatives: Require CUDA for every build; silently build host-only when CUDA is absent.  
-Consequences: CPU CI stays useful; `G4_ENABLE_CUDA=ON` fails if CUDA is missing; native capability remains false
+Consequences: CPU CI stays useful; `GEM16GB_ENABLE_CUDA=ON` fails if CUDA is missing; native capability remains false
 until implemented.  
 Evidence: The neighboring `qwen35x` repository successfully uses optional CUDA language enablement, but its
 silent CPU fallback was tightened here to a fatal error when CUDA is explicitly requested.
@@ -25,13 +25,15 @@ must be fuzzed before the loader is considered production-ready.
 Evidence: Neighboring ad-hoc string-search Safetensors code does not meet this repository's schema and security
 requirements.
 
-## 2026-07-21: Do not use laptop-GPU results as primary RTX 5080 results
+## 2026-07-21: Target the 16 GB CUDA hardware class, Blackwell first
 
 Date: 2026-07-21  
-Decision: Treat the detected RTX 5080 Laptop GPU as a development device only.  
-Context: The project contract targets a desktop RTX 5080 and fixed hardware conditions.  
-Alternatives: Treat all devices with compute capability 12.0 as benchmark-equivalent.  
-Consequences: Correctness and development can proceed locally, but primary performance claims require the exact
-target machine.  
-Evidence: `nvidia-smi` identifies this machine as `NVIDIA GeForce RTX 5080 Laptop GPU` with 16,303 MiB.
-
+Decision: Define the product target as NVIDIA CUDA GPUs with approximately 16 GB VRAM. Optimize and validate the
+first backend on the available Blackwell compute-capability-12.0 GPU.
+Context: The engine should become useful across the 16 GB CUDA class; retail board form factors do not belong in the
+architecture or project identity.
+Alternatives: Bind the project to one retail board; attempt multi-architecture kernels before the first backend is
+correct and competitive.
+Consequences: Blackwell remains the immediate kernel and benchmark target. Later GPU backends must preserve the same
+correctness, memory, and benchmark contracts, and exact board details remain benchmark metadata rather than product
+scope.

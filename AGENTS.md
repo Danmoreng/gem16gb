@@ -1,9 +1,10 @@
 # AGENTS.md
 
-## Project: RTX 5080-Optimized Gemma 4 12B NVFP4 Inference Engine
+## Project: gem16gb — 16 GB CUDA Inference Engine
 
 **Status:** Repository initialization specification  
-**Primary hardware:** NVIDIA GeForce RTX 5080, 16 GB GDDR7, Blackwell, compute capability 12.0  
+**Hardware class:** NVIDIA CUDA GPUs with approximately 16 GB VRAM
+**First optimization target:** Blackwell, compute capability 12.0
 **Primary model:** Gemma 4 12B Unified instruction-tuned model  
 **Primary checkpoint:** `unsloth/gemma-4-12b-it-NVFP4`, pinned to an exact Hugging Face revision  
 **Primary workload:** Text-only, batch-one interactive inference  
@@ -20,7 +21,7 @@ Build a specialized, production-quality CUDA inference engine for Gemma 4 12B Un
 
 1. Loads an existing Hugging Face NVFP4 checkpoint directly.
 2. Does not require users to produce a converted, requantized, or repacked checkpoint on disk.
-3. Exploits Blackwell-native NVFP4 and FP8 Tensor Core operations on an RTX 5080.
+3. Exploits Blackwell-native NVFP4 and FP8 Tensor Core operations on the first reference GPU.
 4. Is optimized first for batch-one interactive decoding.
 5. Supports useful long contexts within 16 GB VRAM.
 6. Preserves model quality within explicitly measured tolerances.
@@ -28,6 +29,7 @@ Build a specialized, production-quality CUDA inference engine for Gemma 4 12B Un
 8. Reports speedups honestly, including differences in tensor formats, quality, context, memory use, and feature support.
 9. Keeps the architecture narrow enough that model-specific kernel fusion is preferred over a generic graph framework.
 10. Remains debuggable, testable, reproducible, and suitable for continued optimization by coding agents.
+11. Evolves into a high-performance engine for 16 GB CUDA GPUs without weakening the first Blackwell path.
 
 The project succeeds only when measured end-to-end inference is faster than the baseline on the target GPU without hidden quality regressions or benchmark shortcuts.
 
@@ -46,7 +48,7 @@ When priorities conflict, use this order:
 7. **Startup and model-loading latency**
 8. **Batch throughput**
 9. **Multimodal support**
-10. **Portability to other GPUs or models**
+10. **Portability to additional 16 GB CUDA GPUs or models**
 
 Do not trade a higher-priority requirement for a lower-priority one without an explicit written decision in `docs/DECISIONS.md`.
 
@@ -59,7 +61,7 @@ Do not trade a higher-priority requirement for a lower-priority one without an e
 The normal user workflow must accept a Hugging Face checkpoint directory directly:
 
 ```bash
-g4-run \
+gem16gb-run \
   --model /models/unsloth-gemma-4-12b-it-NVFP4 \
   --prompt "Explain why the sky is blue."
 ```
@@ -237,7 +239,7 @@ Do not confuse:
 
 ## 4.4 Tensor inventory is authoritative
 
-The first repository tool to implement is `g4-inspect`.
+The first repository tool to implement is `gem16gb-inspect`.
 
 It must print and optionally export JSON containing:
 
@@ -347,18 +349,19 @@ The preferred implementation consumes the existing packed tensor representation 
 
 ## 6.1 Required target
 
-Primary optimization target:
+The product hardware class is a single NVIDIA CUDA GPU with approximately 16 GB of VRAM. The first optimized and
+validated backend is Blackwell:
 
 ```text
-NVIDIA GeForce RTX 5080
-Blackwell
-16 GB GDDR7
-960 GB/s nominal memory bandwidth
+NVIDIA Blackwell GPU
+Approximately 16 GB VRAM
 Compute capability 12.0
 Fifth-generation Tensor Cores
 ```
 
-Initial releases may fail fast on other devices.
+Do not bake a board name, board form factor, nominal memory bandwidth, or power envelope into engine semantics.
+Record those as benchmark-machine facts. Initial releases may fail fast on non-Blackwell devices until
+their architecture-specific backend is implemented and validated.
 
 ## 6.2 Runtime capability check
 
@@ -386,7 +389,7 @@ Prefer architecture-specific translation units for the native path.
 
 The build must:
 
-- compile an RTX 5080 path for SM 12.0;
+- compile the first Blackwell path for SM 12.0;
 - enable the architecture-specific target required for block-scaled NVFP4 MMA when supported by the pinned CUDA toolkit;
 - make native-path compilation visible in build logs;
 - expose a runtime `--print-kernel-capabilities` command;
@@ -401,7 +404,7 @@ Do not guess toolkit flags. Pin a toolchain known to emit the required SM120/SM1
 Create:
 
 ```text
-toolchains/rtx5080.lock
+toolchains/blackwell16gb.lock
 ```
 
 Record:
@@ -430,7 +433,7 @@ The first validated toolchain becomes the reference toolchain. Updates require f
 Required:
 
 - Linux x86-64;
-- one RTX 5080;
+- one approximately 16 GB Blackwell CUDA GPU;
 - text input;
 - text output;
 - batch size one;
@@ -464,7 +467,8 @@ Later:
 - prefix caching;
 - prompt-cache persistence;
 - Windows;
-- other Blackwell GPUs;
+- additional 16 GB NVIDIA CUDA architecture generations;
+- additional Blackwell boards and power envelopes;
 - other Gemma 4 sizes.
 
 ## 7.3 Explicit non-goals for initial development
@@ -492,7 +496,7 @@ Do not spend initial milestones on:
 
 The primary objective is not “high Tensor Core utilization.” It is:
 
-> Maximum correct end-to-end output tokens per second and minimum inter-token latency on one RTX 5080 at batch size one, compared fairly against current upstream llama.cpp.
+> Maximum correct end-to-end output tokens per second and minimum inter-token latency on one 16 GB CUDA GPU at batch size one, compared fairly against current upstream llama.cpp.
 
 Optimize separately for:
 
@@ -635,14 +639,14 @@ Never publish a single unexplained “X times faster” number.
 Implement:
 
 ```bash
-g4-bench model-load
-g4-bench prefill
-g4-bench decode
-g4-bench end-to-end
-g4-bench kernel
-g4-bench memory
-g4-bench quality
-g4-bench mtp
+gem16gb-bench model-load
+gem16gb-bench prefill
+gem16gb-bench decode
+gem16gb-bench end-to-end
+gem16gb-bench kernel
+gem16gb-bench memory
+gem16gb-bench quality
+gem16gb-bench mtp
 ```
 
 Output machine-readable JSON and a concise terminal summary.
@@ -1009,7 +1013,7 @@ Initialize approximately:
 │   ├── CudaArchitectures.cmake
 │   └── Sanitizers.cmake
 ├── include/
-│   └── g4/
+│   └── gem16gb/
 │       ├── engine.h
 │       ├── model.h
 │       ├── sampling.h
@@ -1062,7 +1066,7 @@ Initialize approximately:
 ├── models/
 │   └── gemma4-12b-nvfp4.lock.json
 ├── toolchains/
-│   └── rtx5080.lock
+│   └── blackwell16gb.lock
 ├── docs/
 │   ├── ARCHITECTURE.md
 │   ├── BENCHMARKING.md
@@ -1922,7 +1926,7 @@ Every PR:
 
 ## 24.2 GPU CI
 
-When RTX 5080 CI is available:
+When a 16 GB Blackwell CI runner is available:
 
 - native capability check;
 - CUDA kernel unit tests;
@@ -2191,7 +2195,7 @@ Execute in this order unless blocked.
 ## Task 5: llama.cpp baseline
 
 - pin upstream;
-- build for RTX 5080;
+- build for Blackwell SM120/SM120a;
 - convert source checkpoint;
 - inspect GGUF tensor types;
 - verify native NVFP4;
@@ -2257,7 +2261,7 @@ Only after ordinary decode is competitive.
 ## Inspect
 
 ```bash
-g4-inspect \
+gem16gb-inspect \
   --model /models/gemma-4-12b-it-NVFP4 \
   --json manifest.json \
   --validate
@@ -2266,7 +2270,7 @@ g4-inspect \
 ## Run
 
 ```bash
-g4-run \
+gem16gb-run \
   --model /models/gemma-4-12b-it-NVFP4 \
   --context-profile standard \
   --prompt "Write a CUDA reduction kernel." \
@@ -2279,7 +2283,7 @@ g4-run \
 ## Deterministic correctness
 
 ```bash
-g4-run \
+gem16gb-run \
   --model /models/gemma-4-12b-it-NVFP4 \
   --input-token-ids tests/golden/prompt_001.tokens \
   --greedy \
@@ -2291,7 +2295,7 @@ g4-run \
 ## Benchmark
 
 ```bash
-g4-bench end-to-end \
+gem16gb-bench end-to-end \
   --model /models/gemma-4-12b-it-NVFP4 \
   --suite benchmarks/prompts/core.json \
   --context-profile standard \
@@ -2303,7 +2307,7 @@ g4-bench end-to-end \
 ## Capabilities
 
 ```bash
-g4-run --print-kernel-capabilities
+gem16gb-run --print-kernel-capabilities
 ```
 
 ---
@@ -2393,9 +2397,6 @@ These references motivated the initial design. Pin revisions where possible and 
 
 - Initial checkpoint recipe:  
   https://huggingface.co/unsloth/gemma-4-12b-it-NVFP4/blob/main/recipe.yaml
-
-- NVIDIA RTX 5080 specifications:  
-  https://www.nvidia.com/en-us/geforce/graphics-cards/50-series/rtx-5080/
 
 - NVIDIA CUDA compute-capability table:  
   https://developer.nvidia.com/cuda/gpus

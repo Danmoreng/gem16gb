@@ -1,0 +1,51 @@
+{
+  "status": "converted_quality_characterized_not_benchmark_accepted",
+  "label": "same-source-closest-parity-patched",
+  "source": {
+    "repository": "unsloth/gemma-4-12b-it-NVFP4",
+    "revision": "b1f649734b34aa5575b03d186abd1b9be3d0d5c4"
+  },
+  "llama_cpp": {
+    "commit": "846e991ec3c7ccec49112ff2c5b00b710e5f551d",
+    "version": 10083,
+    "patch": "patches/0001-support-mixed-fp8-nvfp4-compressed-tensors.patch",
+    "patch_sha256": "a811880b1a7828451b7f4efea284be0ae2a48024f96f92fe0a8a45dccfe851f3"
+  },
+  "converter_python": {
+    "python": "3.13.14",
+    "transformers": "5.14.1",
+    "torch": "2.11.0+cu130"
+  },
+  "gguf": {
+    "path": "build/llama_cpp/gemma4-12b-nvfp4-patched.gguf",
+    "size_bytes": 11622734912,
+    "sha256": "e4910e01c4275e58acbf2c38c4d4fb81acf61bb8aa04eed121eb5ac942705e8a",
+    "tensor_count": 955,
+    "nvfp4_tensor_count": 144,
+    "bf16_tensor_count": 185,
+    "f32_tensor_count": 626
+  },
+  "mapping": {
+    "nvfp4_mlp_weights": "packed values and E4M3 block scales repacked losslessly into GGUF NVFP4; reciprocal global/input scales stored as F32 auxiliaries",
+    "fp8_attention_weights": "dequantized using per-channel scales and stored as BF16",
+    "classification": "closest parity only; not exact format parity"
+  },
+  "runtime_probe": {
+    "gpu": "NVIDIA GeForce RTX 5080 Laptop GPU",
+    "context_tokens": 8192,
+    "kv_type": "BF16",
+    "layers_offloaded": "49/49",
+    "cuda_model_mib": 11069.25,
+    "cuda_context_mib": 608,
+    "cuda_compute_mib": 115.52,
+    "cuda_free_mib_after_init": 3837,
+    "first_greedy_token_id": 9503,
+    "first_greedy_text": "blue",
+    "direct_reference_first_token_id": 9503
+  },
+  "limitations": [
+    "The upstream unpatched converter still rejects the mixed compressed-tensors schema.",
+    "The quality fixture has measured autoregressive drift; no acceptance threshold has been adopted.",
+    "A profiler-level native-kernel invocation trace remains required before accepting performance claims."
+  ]
+}

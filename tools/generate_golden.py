@@ -3,7 +3,7 @@
 
 This tool deliberately imports the reference runtime only after parsing its
 arguments. Run it from the pinned, external reference environment documented
-in docs/CORRECTNESS.md; it is not a runtime dependency of g4.
+in docs/CORRECTNESS.md; it is not a runtime dependency of gem16gb.
 """
 
 from __future__ import annotations

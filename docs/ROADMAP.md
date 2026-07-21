@@ -6,8 +6,8 @@ Current stage: Milestone 1, checkpoint inspector and loader.
 
 - Extend the now-committed trusted vLLM token/top-logprob fixture with full-vocabulary logits and selected hidden
   states.
-- Select and lock quality-acceptable GGUFs for llama.cpp tiers B and C; tier A is blocked by the pinned upstream
-  converter's rejection of the checkpoint's mixed compressed-tensors groups.
+- Finish the quality and native-dispatch gates for the patched same-source closest-parity GGUF, then select and lock
+  quality-acceptable GGUFs for llama.cpp tiers B and C. Unpatched upstream conversion remains blocked.
 - Turn the verified text-only inventory into deterministic device-arena and context-profile plans after baseline
   setup is reproducible.
 
@@ -18,21 +18,23 @@ The llama.cpp benchmark is deliberately before engine kernel optimization, but a
 1. The physical C++/Python manifest comparison must be exact. This is complete for all 1,389 tensors.
 2. A trusted direct-load runtime must produce fixed token IDs and reference logits. Batch-one greedy token IDs and
    top-20 log probabilities are now committed and reproduce exactly; full-vocabulary logits remain pending.
-3. The pinned llama.cpp converter must emit a tensor mapping report for the same source revision. Current upstream
-   is pinned, but its converter rejects the checkpoint's mixed FP8/NVFP4 groups; this gate is explicitly blocked,
-   not skipped.
+3. The converter must emit a tensor mapping report for the same source revision. Current unpatched upstream rejects
+   the checkpoint's mixed FP8/NVFP4 groups. The tracked patch now produces a 955-tensor closest-parity GGUF with 144
+   NVFP4 MLP tensors and BF16-mapped attention; its exact inventory and checksum are committed.
 4. Only after native SM120 NVFP4 execution, GPU residency, and quality are proven may timings be labeled as a
    closest-parity or native-NVFP4 baseline.
 5. Maintain a separate fastest-practical llama.cpp baseline even if exact mixed-format parity is impossible.
 
 ## Next milestones
 
-1. Establish and pin viable llama.cpp baseline tiers B and C while retaining the explicit tier-A converter block.
+1. Accept or reject the patched closest-parity characterization, then establish viable llama.cpp tiers B and C.
 2. Capture full-vocabulary reference logits and selected hidden states.
 3. Implement the memory planner and CPU reference operators with strict golden fixtures.
 4. Implement an unfused correctness engine.
 5. Add and disassemble native SM120a NVFP4 kernels.
 6. Specialize attention, KV cache, decode fusion, and CUDA Graph replay.
 7. Validate 64K, then 128K context. MTP and multimodal work remain later milestones.
+8. After the Blackwell backend is correct and competitive, add architecture-specific backends for additional 16 GB
+   CUDA GPUs without weakening benchmark or memory contracts.
 
 The detailed gates and ordering in `AGENTS.md` are authoritative.

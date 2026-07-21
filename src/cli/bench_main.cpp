@@ -6,7 +6,7 @@ int main(int argc, char** argv) {
   constexpr std::array modes = {
       "model-load", "prefill", "decode", "end-to-end", "kernel", "memory", "quality", "mtp"};
   if (argc == 2 && (std::string_view(argv[1]) == "--help" || std::string_view(argv[1]) == "-h")) {
-    std::cout << "Usage: g4-bench <model-load|prefill|decode|end-to-end|kernel|memory|quality|mtp> [options]\n";
+    std::cout << "Usage: gem16gb-bench <model-load|prefill|decode|end-to-end|kernel|memory|quality|mtp> [options]\n";
     return 0;
   }
   const std::string_view requested = argc > 1 ? std::string_view(argv[1]) : std::string_view{};

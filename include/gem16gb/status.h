@@ -4,7 +4,7 @@
 #include <string>
 #include <utility>
 
-namespace g4 {
+namespace gem16gb {
 
 enum class StatusCode {
   kOk = 0,
@@ -48,5 +48,4 @@ class [[nodiscard]] Result {
   Status status_ = Status(StatusCode::kInternal, "Result has no value");
 };
 
-}  // namespace g4
-
+}  // namespace gem16gb

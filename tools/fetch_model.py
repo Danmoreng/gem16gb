@@ -56,7 +56,7 @@ def download(url: str, destination: Path, expected_size: int) -> None:
     offset = partial.stat().st_size if partial.exists() else 0
     if offset > expected_size:
         raise RuntimeError(f"partial file is larger than lock size: {partial}")
-    headers = {"User-Agent": "g4-fetch-model/1"}
+    headers = {"User-Agent": "gem16gb-fetch-model/1"}
     token = os.environ.get("HF_TOKEN")
     if token:
         headers["Authorization"] = f"Bearer {token}"

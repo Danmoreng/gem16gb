@@ -8,8 +8,8 @@ void RunSafetensorsTests();
 int main() {
   RunJsonTests();
   RunSafetensorsTests();
-  if (g4::test::failures != 0) {
-    std::cerr << g4::test::failures << " test assertion(s) failed\n";
+  if (gem16gb::test::failures != 0) {
+    std::cerr << gem16gb::test::failures << " test assertion(s) failed\n";
     return 1;
   }
   std::cout << "all host unit tests passed\n";

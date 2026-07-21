@@ -1,11 +1,11 @@
-#include "g4/model.h"
+#include "gem16gb/model.h"
 
 #include <array>
 
 #include "model/config.h"
 #include "model/manifest.h"
 
-namespace g4 {
+namespace gem16gb {
 
 Result<ModelManifest> InspectCheckpoint(const InspectOptions& options) {
   if (options.model_directory.empty()) {
@@ -33,5 +33,5 @@ Result<ModelManifest> InspectCheckpoint(const InspectOptions& options) {
   return internal::BuildManifest(options.model_directory, config.value(), options.validate);
 }
 
-}  // namespace g4
+}  // namespace gem16gb
 

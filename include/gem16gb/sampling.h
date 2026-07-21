@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-namespace g4 {
+namespace gem16gb {
 
 struct SamplingOptions {
   float temperature = 1.0F;
@@ -12,4 +12,4 @@ struct SamplingOptions {
   std::uint64_t seed = 0;
 };
 
-}  // namespace g4
+}  // namespace gem16gb
