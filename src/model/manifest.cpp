@@ -103,6 +103,62 @@ std::string ShapeText(const std::vector<std::uint64_t>& shape) {
   return output.str();
 }
 
+Status ValidateLayerTensorInventory(const ModelConfig& config, const std::set<std::string>& tensor_names) {
+  constexpr std::array<std::string_view, 27> common_suffixes = {
+      "input_layernorm.weight",
+      "layer_scalar",
+      "mlp.down_proj.input_global_scale",
+      "mlp.down_proj.weight_global_scale",
+      "mlp.down_proj.weight_packed",
+      "mlp.down_proj.weight_scale",
+      "mlp.gate_proj.input_global_scale",
+      "mlp.gate_proj.weight_global_scale",
+      "mlp.gate_proj.weight_packed",
+      "mlp.gate_proj.weight_scale",
+      "mlp.up_proj.input_global_scale",
+      "mlp.up_proj.weight_global_scale",
+      "mlp.up_proj.weight_packed",
+      "mlp.up_proj.weight_scale",
+      "post_attention_layernorm.weight",
+      "post_feedforward_layernorm.weight",
+      "pre_feedforward_layernorm.weight",
+      "self_attn.k_norm.weight",
+      "self_attn.k_proj.weight",
+      "self_attn.k_proj.weight_scale",
+      "self_attn.k_scale",
+      "self_attn.o_proj.weight",
+      "self_attn.o_proj.weight_scale",
+      "self_attn.q_norm.weight",
+      "self_attn.q_proj.weight",
+      "self_attn.q_proj.weight_scale",
+      "self_attn.v_scale",
+  };
+  constexpr std::array<std::string_view, 2> local_only_suffixes = {
+      "self_attn.v_proj.weight", "self_attn.v_proj.weight_scale"};
+
+  std::set<std::string> expected;
+  for (std::size_t layer = 0; layer < config.layer_types.size(); ++layer) {
+    const std::string prefix = "model.language_model.layers." + std::to_string(layer) + ".";
+    for (const auto suffix : common_suffixes) expected.insert(prefix + std::string(suffix));
+    if (config.layer_types[layer] == "sliding_attention") {
+      for (const auto suffix : local_only_suffixes) expected.insert(prefix + std::string(suffix));
+    }
+  }
+
+  std::set<std::string> actual;
+  constexpr std::string_view layer_prefix = "model.language_model.layers.";
+  for (const auto& name : tensor_names) {
+    if (name.starts_with(layer_prefix)) actual.insert(name);
+  }
+  for (const auto& name : expected) {
+    if (!actual.contains(name)) return Status(StatusCode::kDataLoss, "required decoder-layer tensor is missing: " + name);
+  }
+  for (const auto& name : actual) {
+    if (!expected.contains(name)) return Status(StatusCode::kUnsupported, "unexpected decoder-layer tensor: " + name);
+  }
+  return Status::Ok();
+}
+
 void WriteString(std::ostream& output, std::string_view value) {
   output << '"' << json::Escape(value) << '"';
 }
@@ -243,6 +299,10 @@ Result<ModelManifest> BuildManifest(const std::filesystem::path& model_directory
     if (names.contains("lm_head.weight") || names.contains("model.language_model.lm_head.weight")) {
       return Status(StatusCode::kDataLoss, "tied checkpoint unexpectedly stores a duplicate LM head");
     }
+  }
+  if (validate) {
+    const auto inventory_status = ValidateLayerTensorInventory(config, names);
+    if (!inventory_status.ok()) return inventory_status;
   }
   return manifest;
 }

@@ -15,7 +15,6 @@ gpu_compute_capability=12.0
 gpu_vram=16303 MiB
 gpu_vbios=98.03.5C.00.F2
 cutlass_commit=UNPINNED_NOT_USED
-llama_cpp_commit=UNPINNED
+llama_cpp_commit=846e991ec3c7ccec49112ff2c5b00b710e5f551d
 model_revision=b1f649734b34aa5575b03d186abd1b9be3d0d5c4
 note=This is not the primary desktop RTX 5080 benchmark machine.
-

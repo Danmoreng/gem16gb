@@ -2,6 +2,7 @@
 /out/
 /.cache/
 /models/checkpoints/
+/third_party/cache/
 /benchmarks/results/*
 !/benchmarks/results/.gitkeep
 *.log
@@ -10,4 +11,3 @@
 *.ncu-rep
 __pycache__/
 *.py[cod]
-

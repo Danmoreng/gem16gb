@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-07-21",
+  "checkpoint": {
+    "repository": "unsloth/gemma-4-12b-it-NVFP4",
+    "revision": "b1f649734b34aa5575b03d186abd1b9be3d0d5c4",
+    "quant_method": "compressed-tensors",
+    "format": "mixed-precision",
+    "config_group_formats": [
+      "float-quantized",
+      "nvfp4-pack-quantized"
+    ]
+  },
+  "llama_cpp_commit": "846e991ec3c7ccec49112ff2c5b00b710e5f551d",
+  "converter_environment": {
+    "python": "3.10",
+    "torch": "2.11.0+cpu",
+    "transformers": "4.57.6"
+  },
+  "command": "convert_hf_to_gguf.py --dry-run --outtype auto --outfile build/llama_cpp/gemma4-12b-nvfp4.gguf models/checkpoints/unsloth-gemma-4-12b-it-NVFP4-b1f6497",
+  "exit_code": 1,
+  "status": "blocked",
+  "stage": "dequant_model",
+  "error_type": "NotImplementedError",
+  "error": "Can't handle multiple config groups for compressed-tensors yet",
+  "gguf_written": false,
+  "timing_valid": false
+}

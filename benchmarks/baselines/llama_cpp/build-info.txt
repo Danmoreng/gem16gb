@@ -1,2 +1,20 @@
-NOT_BUILT
-
+status=BUILT_NOT_BENCHMARK_READY
+captured_at=2026-07-21
+llama_cpp_commit=846e991ec3c7ccec49112ff2c5b00b710e5f551d
+llama_cpp_version=10083
+build_type=Release
+cmake=4.4.0
+host_compiler=GNU 16.1.1
+cuda_host_compiler=GNU 15.3.0
+cuda_toolkit=13.3.73
+cuda_architectures=120a-real
+ggml_cuda=ON
+ggml_native=OFF
+targets=llama-cli,llama-bench,llama-quantize
+gpu=NVIDIA GeForce RTX 5080 Laptop GPU
+gpu_compute_capability=12.0
+gpu_vram_reported_by_llama_cpp=15880 MiB
+nvfp4_object=template-instances/mmq-instance-nvfp4.cu.o
+nvfp4_object_arch=sm_120a
+nvfp4_sass=OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X
+note=Build and instruction presence are proven; model dispatch, residency, quality, and benchmark validity are not.
