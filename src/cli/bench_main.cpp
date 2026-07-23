@@ -1,10 +1,16 @@
 #include <array>
+#include <charconv>
 #include <cstdint>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
+#include <string>
 #include <string_view>
 
 #include "gem16gb/memory.h"
+#if GEM16GB_HAS_CUDA
+#include "cuda/nvfp4/checkpoint_probe.h"
+#endif
 
 namespace {
 
@@ -14,7 +20,22 @@ void Usage(std::ostream& output) {
          << "Memory mode:\n"
          << "  gem16gb-bench memory --model <checkpoint-dir>\n"
          << "      --profile <interactive|standard|long|xlong|max>\n"
-         << "      --kv-storage <shared|separate> [--kv-element-bytes <1|2>]\n";
+         << "      --kv-storage <shared|separate> [--kv-element-bytes <1|2>]\n"
+         << "\n"
+         << "Kernel mode (CUDA):\n"
+         << "  gem16gb-bench kernel --model <checkpoint-dir>\n"
+         << "      [--projection <gate|up|down|mlp>]\n"
+         << "      [--warmups <count>] [--iterations <count>]\n";
+}
+
+bool ParsePositiveU32(std::string_view value, std::uint32_t& parsed) {
+  std::uint32_t candidate = 0;
+  const auto result = std::from_chars(value.data(), value.data() + value.size(), candidate);
+  if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || candidate == 0) {
+    return false;
+  }
+  parsed = candidate;
+  return true;
 }
 
 bool ParseProfile(std::string_view value, gem16gb::ContextProfile& profile) {
@@ -84,6 +105,160 @@ int RunMemoryMode(int argc, char** argv) {
   return 0;
 }
 
+int RunKernelMode(int argc, char** argv) {
+  std::filesystem::path model_directory;
+  std::string projection = "gate";
+  std::uint32_t warmups = 3;
+  std::uint32_t iterations = 10;
+  for (int index = 2; index < argc; ++index) {
+    const std::string_view argument(argv[index]);
+    if (argument == "--model" && index + 1 < argc) {
+      model_directory = std::filesystem::path(argv[++index]);
+    } else if (argument == "--projection" && index + 1 < argc) {
+      projection = argv[++index];
+      if (projection != "gate" && projection != "up" && projection != "down" &&
+          projection != "mlp") {
+        std::cerr << "error: --projection must be gate, up, down, or mlp\n";
+        return 64;
+      }
+    } else if (argument == "--warmups" && index + 1 < argc) {
+      if (!ParsePositiveU32(argv[++index], warmups)) {
+        std::cerr << "error: --warmups must be a positive integer\n";
+        return 64;
+      }
+    } else if (argument == "--iterations" && index + 1 < argc) {
+      if (!ParsePositiveU32(argv[++index], iterations)) {
+        std::cerr << "error: --iterations must be a positive integer\n";
+        return 64;
+      }
+    } else {
+      std::cerr << "error: unknown or incomplete kernel option: " << argument << '\n';
+      Usage(std::cerr);
+      return 64;
+    }
+  }
+  if (model_directory.empty()) {
+    std::cerr << "error: kernel mode requires --model\n";
+    return 64;
+  }
+
+#if GEM16GB_HAS_CUDA
+  if (projection == "mlp") {
+    auto result = gem16gb::internal::RunLayer0Nvfp4MlpCheckpointProbe(
+        model_directory, warmups, iterations);
+    if (!result.ok()) {
+      std::cerr << "error: " << result.status().message() << '\n';
+      return 1;
+    }
+    const auto& probe = result.value();
+    std::cerr << "NVFP4 complete Layer-0 MLP checkpoint probe\n"
+              << "  path: quantize -> Gate/Up -> GELU-tanh product -> quantize -> Down -> residual\n"
+              << "  CPU/GPU input bytes: "
+              << (probe.input_activation_bytes_match ? "exact match" : "MISMATCH") << '\n'
+              << "  CPU/GPU reference Down-input bytes: "
+              << (probe.reference_down_activation_bytes_match ? "exact match" : "MISMATCH")
+              << '\n'
+              << "  reference/native Down-input differing bytes: "
+              << probe.native_down_activation_mismatched_bytes << '\n'
+              << "  reference/native final max abs: " << probe.reference_native_max_abs << '\n'
+              << "  SM120 direct MLP average: " << probe.sm120_direct_ms << " ms\n";
+    std::cout << std::setprecision(17)
+              << "{\"schema_version\":1,\"status\":\"characterization\","
+              << "\"benchmark_qualified\":false,\"mode\":\"kernel\",\"fallbacks\":0,"
+              << "\"operator\":\"nvfp4_layer0_mlp\",\"shape\":{\"hidden\":3840,"
+              << "\"intermediate\":15360},\"precision\":\"w4a4_nvfp4\","
+              << "\"instruction\":" << std::quoted(probe.instruction)
+              << ",\"source_layout_direct\":true,\"persistent_repack_bytes\":0"
+              << ",\"device_bytes\":" << probe.device_bytes
+              << ",\"input_activation_bytes_match\":"
+              << (probe.input_activation_bytes_match ? "true" : "false")
+              << ",\"reference_down_activation_bytes_match\":"
+              << (probe.reference_down_activation_bytes_match ? "true" : "false")
+              << ",\"native_down_activation_mismatched_bytes\":"
+              << probe.native_down_activation_mismatched_bytes
+              << ",\"timing_ms\":{\"warmups\":" << warmups
+              << ",\"iterations\":" << iterations
+              << ",\"cuda_reference_single\":" << probe.cuda_reference_ms
+              << ",\"sm120_direct_average\":" << probe.sm120_direct_ms << '}'
+              << ",\"error\":{\"reference_native_max_abs\":"
+              << probe.reference_native_max_abs
+              << ",\"reference_native_rms\":" << probe.reference_native_rms
+              << ",\"reference_native_cosine\":" << probe.reference_native_cosine
+              << ",\"oracle_reference_max_abs\":" << probe.oracle_reference_max_abs
+              << ",\"oracle_native_max_abs\":" << probe.oracle_native_max_abs << '}'
+              << ",\"samples\":[";
+    for (std::size_t index = 0; index < probe.samples.size(); ++index) {
+      if (index != 0) std::cout << ',';
+      const auto& sample = probe.samples[index];
+      std::cout << "{\"row\":" << sample.row << ",\"oracle\":" << sample.oracle
+                << ",\"cuda_reference\":" << sample.cuda_reference
+                << ",\"sm120_direct\":" << sample.sm120_direct << '}';
+    }
+    std::cout << "]}\n";
+    return probe.input_activation_bytes_match &&
+                   probe.reference_down_activation_bytes_match
+               ? 0
+               : 1;
+  }
+  auto result = gem16gb::internal::RunLayer0Nvfp4CheckpointProbe(
+      model_directory, projection, warmups, iterations);
+  if (!result.ok()) {
+    std::cerr << "error: " << result.status().message() << '\n';
+    return 1;
+  }
+  const auto& probe = result.value();
+  std::cerr << "NVFP4 layer-0 " << projection << " checkpoint probe\n"
+            << "  tensor: " << probe.tensor_name << '\n'
+            << "  shape: " << probe.rows << " x " << probe.contracting_elements << '\n'
+            << "  CPU/GPU activation bytes: "
+            << (probe.activation_bytes_match ? "exact match" : "MISMATCH") << '\n'
+            << "  CUDA reference/native max abs: " << probe.reference_native_max_abs << '\n'
+            << "  SM120 direct average: " << probe.sm120_direct_ms << " ms\n";
+
+  std::cout << std::setprecision(17)
+            << "{\"schema_version\":1,\"status\":\"characterization\","
+            << "\"benchmark_qualified\":false,\"mode\":\"kernel\",\"fallbacks\":0,"
+            << "\"operator\":" << std::quoted("nvfp4_layer0_" + projection)
+            << ",\"tensor\":"
+            << std::quoted(probe.tensor_name)
+            << ",\"shape\":[" << probe.rows << ',' << probe.contracting_elements << ']'
+            << ",\"precision\":\"w4a4_nvfp4\",\"instruction\":"
+            << std::quoted(probe.instruction)
+            << ",\"source_layout_direct\":true,\"persistent_repack_bytes\":0"
+            << ",\"packed_weight_bytes\":" << probe.packed_weight_bytes
+            << ",\"weight_scale_bytes\":" << probe.weight_scale_bytes
+            << ",\"device_bytes\":" << probe.device_bytes
+            << ",\"input_global_divisor\":" << probe.input_global_divisor
+            << ",\"weight_global_divisor\":" << probe.weight_global_divisor
+            << ",\"activation_bytes_match\":"
+            << (probe.activation_bytes_match ? "true" : "false")
+            << ",\"timing_ms\":{\"warmups\":" << warmups
+            << ",\"iterations\":" << iterations
+            << ",\"activation_quantize_average\":" << probe.activation_quantize_ms
+            << ",\"cuda_reference_single\":" << probe.cuda_reference_ms
+            << ",\"sm120_direct_average\":" << probe.sm120_direct_ms << '}'
+            << ",\"error\":{\"reference_native_max_abs\":"
+            << probe.reference_native_max_abs
+            << ",\"reference_native_rms\":" << probe.reference_native_rms
+            << ",\"reference_native_cosine\":" << probe.reference_native_cosine
+            << ",\"oracle_reference_max_abs\":" << probe.oracle_reference_max_abs
+            << ",\"oracle_native_max_abs\":" << probe.oracle_native_max_abs << '}'
+            << ",\"samples\":[";
+  for (std::size_t index = 0; index < probe.samples.size(); ++index) {
+    if (index != 0) std::cout << ',';
+    const auto& sample = probe.samples[index];
+    std::cout << "{\"row\":" << sample.row << ",\"oracle\":" << sample.oracle
+              << ",\"cuda_reference\":" << sample.cuda_reference
+              << ",\"sm120_direct\":" << sample.sm120_direct << '}';
+  }
+  std::cout << "]}\n";
+  return probe.activation_bytes_match ? 0 : 1;
+#else
+  std::cerr << "error: kernel mode requires a CUDA build\n";
+  return 2;
+#endif
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -95,6 +270,7 @@ int main(int argc, char** argv) {
   }
   const std::string_view requested = argc > 1 ? std::string_view(argv[1]) : std::string_view{};
   if (requested == "memory") return RunMemoryMode(argc, argv);
+  if (requested == "kernel") return RunKernelMode(argc, argv);
 
   bool known = false;
   for (const auto mode : modes) known = known || requested == mode;

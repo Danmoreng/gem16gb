@@ -1,5 +1,6 @@
 #include "cuda/nvfp4/reference.h"
 #include "cuda/nvfp4/sm120.h"
+#include "cuda/nvfp4/mlp.h"
 #include "gem16gb/nvfp4.h"
 
 #include <cuda_runtime.h>
@@ -222,6 +223,63 @@ void TestDirectSourceSm120Projection() {
   }
 }
 
+float GeluTanhReference(float value) {
+  constexpr float square_root_two_over_pi = 0.7978845608028654F;
+  constexpr float cubic = 0.044715F;
+  return 0.5F * value *
+         (1.0F + std::tanh(square_root_two_over_pi *
+                           (value + cubic * value * value * value)));
+}
+
+void TestMlpElementwiseBridge() {
+  constexpr std::array<float, 9> gate = {
+      -4.0F, -1.5F, -0.25F, -0.0F, 0.0F, 0.125F, 0.75F, 2.0F, 5.0F};
+  constexpr std::array<float, 9> up = {
+      0.5F, -2.0F, 3.0F, 4.0F, -5.0F, 1.25F, -0.75F, 2.5F, -0.125F};
+  constexpr std::array<float, 9> residual = {
+      1.0F, 0.5F, -0.5F, 2.0F, -2.0F, 0.25F, 0.0F, -1.0F, 3.0F};
+
+  DeviceBuffer<float> device_gate(gate.size());
+  DeviceBuffer<float> device_up(up.size());
+  DeviceBuffer<float> device_product(gate.size());
+  DeviceBuffer<float> device_residual(residual.size());
+  DeviceBuffer<float> device_output(gate.size());
+  if (device_gate.get() == nullptr || device_up.get() == nullptr ||
+      device_product.get() == nullptr || device_residual.get() == nullptr ||
+      device_output.get() == nullptr) {
+    return;
+  }
+  if (!CudaOk(cudaMemcpy(device_gate.get(), gate.data(), device_gate.bytes(),
+                         cudaMemcpyHostToDevice), "copy Gate") ||
+      !CudaOk(cudaMemcpy(device_up.get(), up.data(), device_up.bytes(),
+                         cudaMemcpyHostToDevice), "copy Up") ||
+      !CudaOk(cudaMemcpy(device_residual.get(), residual.data(), device_residual.bytes(),
+                         cudaMemcpyHostToDevice), "copy residual")) {
+    return;
+  }
+
+  const auto product_status = gem16gb::internal::LaunchGeluTanhProduct(
+      device_gate.get(), device_up.get(), device_product.get(), gate.size(), nullptr);
+  CUDA_TEST_CHECK(product_status.ok());
+  const auto residual_status = gem16gb::internal::LaunchAddResidual(
+      device_product.get(), device_residual.get(), device_output.get(), gate.size(), nullptr);
+  CUDA_TEST_CHECK(residual_status.ok());
+  if (!product_status.ok() || !residual_status.ok() ||
+      !CudaOk(cudaDeviceSynchronize(), "MLP elementwise synchronize")) {
+    return;
+  }
+
+  std::array<float, gate.size()> output{};
+  if (!CudaOk(cudaMemcpy(output.data(), device_output.get(), device_output.bytes(),
+                         cudaMemcpyDeviceToHost), "copy MLP elementwise output")) {
+    return;
+  }
+  for (std::size_t index = 0; index < output.size(); ++index) {
+    const float expected = GeluTanhReference(gate[index]) * up[index] + residual[index];
+    CUDA_TEST_CHECK(std::fabs(output[index] - expected) < 1.0e-6F);
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -232,6 +290,7 @@ int main() {
   }
   TestCudaIntrinsicConformanceAndProjection();
   TestDirectSourceSm120Projection();
+  TestMlpElementwiseBridge();
   if (failures != 0) {
     std::cerr << failures << " CUDA test assertion(s) failed\n";
     return 1;

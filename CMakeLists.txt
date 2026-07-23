@@ -62,6 +62,9 @@ if(GEM16GB_ENABLE_CUDA)
   gem16gb_configure_cuda_architectures()
   target_sources(gem16gb_core PRIVATE
     src/cuda/dispatch.cu
+    src/cuda/nvfp4/checkpoint_probe.cu
+    src/cuda/nvfp4/mlp.cu
+    src/cuda/nvfp4/mlp_checkpoint_probe.cu
     src/cuda/nvfp4/reference.cu
     src/cuda/nvfp4/sm120.cu
   )
@@ -74,6 +77,16 @@ if(GEM16GB_ENABLE_CUDA)
     )
     set_property(SOURCE src/cuda/nvfp4/sm120.cu APPEND PROPERTY COMPILE_OPTIONS
       -Xcompiler=/wd4211
+    )
+    set_property(SOURCE src/cuda/nvfp4/mlp.cu APPEND PROPERTY COMPILE_OPTIONS
+      -Xcompiler=/wd4211
+    )
+    set_property(SOURCE src/cuda/nvfp4/mlp_checkpoint_probe.cu APPEND PROPERTY COMPILE_OPTIONS
+      -Xcompiler=/wd4211
+      -diag-suppress=2810
+    )
+    set_property(SOURCE src/cuda/nvfp4/checkpoint_probe.cu APPEND PROPERTY COMPILE_OPTIONS
+      -diag-suppress=2810
     )
   endif()
   target_link_libraries(gem16gb_core PRIVATE CUDA::cudart)
@@ -97,6 +110,7 @@ foreach(tool IN ITEMS inspect run bench)
   gem16gb_set_project_warnings(gem16gb-${tool})
   gem16gb_enable_sanitizers(gem16gb-${tool})
 endforeach()
+target_include_directories(gem16gb-bench PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
 include(CTest)
 if(BUILD_TESTING AND GEM16GB_BUILD_TESTS)

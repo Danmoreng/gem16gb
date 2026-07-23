@@ -23,9 +23,20 @@ layer 0 Gate row 0 of the locked checkpoint.
 
 The CUDA correctness route independently uses CUDA 13.3 FP4/FP8 conversion types, matches the host packed
 activation and scale bytes, and matches the host projection oracle. A separate experimental SM120a kernel consumes
-the compact source weight and scale layouts directly; its synthetic eight-row/64-K output matches the same oracle.
-Disassembly of the CUDA test binary contains `OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X`. This is instruction-path
-evidence only, not yet a real-shape or production-kernel qualification.
+the compact source weight and scale layouts directly. Its synthetic eight-row/64-K output and all three real
+Layer-0 MLP projection shapes match the same oracle. The real Gate, Up, and Down maximum CUDA-reference/native
+absolute differences were `1.1920929e-7`, `5.9604645e-8`, and `0`, respectively.
+
+The first complete Layer-0 MLP characterization now executes input quantization, Gate and Up, Gemma GELU-tanh
+product, Down-input quantization, Down, and residual addition without a host round trip. CPU/CUDA quantized input
+bytes match exactly at both quantization boundaries. For its deterministic fixture the native and CUDA-reference
+Down-input bytes and all 3,840 final float values also match exactly; eight final rows match the binary64 Down
+oracle plus residual within `6.7374888e-9`. This remains a deterministic characterization, not a substitute for
+the pinned hidden-state golden distribution.
+
+Disassembly of the CUDA test binary contains `OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X`. This is native-instruction and
+real-shape evidence, but the kernel remains experimental until layer-golden, numerical-distribution, memory-arena,
+and end-to-end gates pass.
 
 Reproduce the instruction check with:
 
@@ -35,7 +46,7 @@ python tools/verify_sm120_sass.py build/<OS>/blackwell-release/bin/gem16gb-cuda-
 
 ## Not yet established
 
-Real-shape projection distributions, layer tolerances, full-vocabulary logits, hidden-state comparisons,
+Broad projection distributions, layer tolerances, full-vocabulary logits, trusted-runtime hidden-state comparisons,
 cross-engine generation agreement, and task quality have not been measured. Therefore `tests/tolerances.yaml` is
 intentionally empty. The committed vLLM
 fixture provides greedy token IDs and top-20 log probabilities, but it is not a substitute for full-logit Level 3
