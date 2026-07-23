@@ -44,7 +44,15 @@ route. The real Layer-0 Q `[4096,3840]`, K/V `[2048,3840]`, and O `[3840,4096]` 
 CPU/CUDA activation bytes and scale bits. Across those fixtures the largest CUDA-reference/native absolute
 difference is `8.9406967e-7`; the largest selected-row binary64/native difference is below `1.0e-7`.
 Disassembly additionally contains `QMMA.16832.F32.E4M3.E4M3`. As with NVFP4, this proves the intended arithmetic
-instruction and real storage mapping, not yet a complete attention layer.
+instruction and real storage mapping.
+
+The first unfused local-attention checkpoint characterization now executes the real Layer-0 BF16 norm tensors and
+FP8 Q/K/V/O tensor families through input RMSNorm, per-head Q/K normalization, scale-free V normalization, local
+RoPE at position 31, K/V append/read, grouped-query causal attention over a deterministic 32-token cache, FP32
+softmax, O projection, post-attention RMSNorm, and the residual update. The direct SM120 and independent CUDA scalar
+projection routes produce a final 3,840-element maximum absolute difference of `4.8398972e-5`, RMS difference
+`4.2503101e-6`, and cosine similarity `0.9999999999984577`. This validates operator composition and real tensor
+binding without a persistent repack; it is not yet a trusted-runtime hidden-state golden or a performance result.
 
 Reproduce the instruction check with:
 

@@ -1,9 +1,11 @@
 #include "cuda/fp8/reference.h"
 #include "cuda/fp8/sm120.h"
+#include "cuda/layer/reference.h"
 #include "cuda/nvfp4/reference.h"
 #include "cuda/nvfp4/sm120.h"
 #include "cuda/nvfp4/mlp.h"
 #include "gem16gb/fp8.h"
+#include "gem16gb/layer.h"
 #include "gem16gb/nvfp4.h"
 
 #include <cuda_runtime.h>
@@ -388,6 +390,100 @@ void TestFp8ReferenceAndDirectProjection() {
   }
 }
 
+void TestLocalLayerReferenceOperators() {
+  constexpr std::size_t query_heads = 4;
+  constexpr std::size_t kv_heads = 2;
+  constexpr std::size_t head_dimension = 4;
+  constexpr std::size_t tokens = 3;
+  constexpr std::array<float, query_heads * head_dimension> query = {
+      1.0F, 0.0F, 0.5F, -0.5F, 0.0F, 1.0F, -0.5F, 0.5F,
+      0.75F, -0.25F, 0.5F, 0.0F, -0.5F, 0.25F, 0.75F, 0.5F};
+  constexpr std::array<float, tokens * kv_heads * head_dimension> key_cache = {
+      1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F,
+      0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F,
+      0.5F, 0.5F, 0.0F, 0.0F, 0.0F, 0.5F, 0.5F, 0.0F};
+  constexpr std::array<float, tokens * kv_heads * head_dimension> value_cache = {
+      1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F, 7.0F, 8.0F,
+      2.0F, 4.0F, 6.0F, 8.0F, 10.0F, 12.0F, 14.0F, 16.0F,
+      3.0F, 6.0F, 9.0F, 12.0F, 15.0F, 18.0F, 21.0F, 24.0F};
+
+  const auto host_attention = gem16gb::layer::LocalAttentionDecode(
+      query, key_cache, value_cache, query_heads, kv_heads, head_dimension, tokens);
+  CUDA_TEST_CHECK(host_attention.ok());
+  if (!host_attention.ok()) return;
+
+  DeviceBuffer<float> device_query(query.size());
+  DeviceBuffer<float> device_keys(key_cache.size());
+  DeviceBuffer<float> device_values(value_cache.size());
+  DeviceBuffer<float> device_scores(query_heads * tokens);
+  DeviceBuffer<float> device_output(query.size());
+  if (device_query.get() == nullptr || device_keys.get() == nullptr ||
+      device_values.get() == nullptr || device_scores.get() == nullptr ||
+      device_output.get() == nullptr) return;
+  if (!CudaOk(cudaMemcpy(device_query.get(), query.data(), device_query.bytes(), cudaMemcpyHostToDevice),
+              "copy layer query") ||
+      !CudaOk(cudaMemcpy(device_keys.get(), key_cache.data(), device_keys.bytes(), cudaMemcpyHostToDevice),
+              "copy layer keys") ||
+      !CudaOk(cudaMemcpy(device_values.get(), value_cache.data(), device_values.bytes(), cudaMemcpyHostToDevice),
+              "copy layer values")) return;
+
+  const auto attention_status = gem16gb::internal::LaunchLocalAttentionDecode(
+      device_query.get(), device_keys.get(), device_values.get(), device_scores.get(),
+      device_output.get(), query_heads, kv_heads, head_dimension, tokens, nullptr);
+  CUDA_TEST_CHECK(attention_status.ok());
+  if (!attention_status.ok() || !CudaOk(cudaDeviceSynchronize(), "layer attention synchronize")) return;
+  std::array<float, query.size()> gpu_attention{};
+  if (!CudaOk(cudaMemcpy(gpu_attention.data(), device_output.get(), device_output.bytes(),
+                         cudaMemcpyDeviceToHost), "copy layer attention output")) return;
+  for (std::size_t index = 0; index < gpu_attention.size(); ++index) {
+    CUDA_TEST_CHECK(std::fabs(gpu_attention[index] - host_attention.value()[index]) < 2.0e-5F);
+  }
+
+  constexpr std::array<float, 8> norm_input = {
+      1.0F, -2.0F, 3.0F, -4.0F, 0.5F, 1.5F, -0.5F, -1.5F};
+  constexpr std::array<float, 4> norm_weight = {1.0F, 0.5F, 2.0F, 1.5F};
+  constexpr std::array<std::uint16_t, 4> norm_weight_bf16 = {
+      0x3F80U, 0x3F00U, 0x4000U, 0x3FC0U};
+  const auto host_norm = gem16gb::layer::RmsNorm(norm_input, norm_weight, 2, 4, 1.0e-6F);
+  CUDA_TEST_CHECK(host_norm.ok());
+  DeviceBuffer<float> device_norm_input(norm_input.size());
+  DeviceBuffer<std::uint16_t> device_norm_weight(norm_weight_bf16.size());
+  DeviceBuffer<float> device_norm_output(norm_input.size());
+  if (!host_norm.ok() || device_norm_input.get() == nullptr || device_norm_weight.get() == nullptr ||
+      device_norm_output.get() == nullptr) return;
+  if (!CudaOk(cudaMemcpy(device_norm_input.get(), norm_input.data(), device_norm_input.bytes(), cudaMemcpyHostToDevice),
+              "copy norm input") ||
+      !CudaOk(cudaMemcpy(device_norm_weight.get(), norm_weight_bf16.data(), device_norm_weight.bytes(),
+                         cudaMemcpyHostToDevice), "copy norm weight")) return;
+  const auto norm_status = gem16gb::internal::LaunchRmsNorm(
+      device_norm_input.get(), device_norm_weight.get(), device_norm_output.get(), 2, 4, 1.0e-6F, nullptr);
+  CUDA_TEST_CHECK(norm_status.ok());
+  if (!norm_status.ok() || !CudaOk(cudaDeviceSynchronize(), "RMSNorm synchronize")) return;
+  std::array<float, norm_input.size()> gpu_norm{};
+  if (!CudaOk(cudaMemcpy(gpu_norm.data(), device_norm_output.get(), device_norm_output.bytes(),
+                         cudaMemcpyDeviceToHost), "copy norm output")) return;
+  for (std::size_t index = 0; index < gpu_norm.size(); ++index) {
+    CUDA_TEST_CHECK(std::fabs(gpu_norm[index] - host_norm.value()[index]) < 2.0e-6F);
+  }
+
+  std::array<float, 8> host_rope = {1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F, 7.0F, 8.0F};
+  DeviceBuffer<float> device_rope(host_rope.size());
+  if (device_rope.get() == nullptr ||
+      !CudaOk(cudaMemcpy(device_rope.get(), host_rope.data(), device_rope.bytes(), cudaMemcpyHostToDevice),
+              "copy RoPE input")) return;
+  CUDA_TEST_CHECK(gem16gb::layer::ApplyRotaryEmbedding(host_rope, 1, 8, 8, 37, 10000.0).ok());
+  const auto rope_status = gem16gb::internal::LaunchRotaryEmbedding(
+      device_rope.get(), 1, 8, 8, 37, 10000.0, nullptr);
+  CUDA_TEST_CHECK(rope_status.ok());
+  if (!rope_status.ok() || !CudaOk(cudaDeviceSynchronize(), "RoPE synchronize")) return;
+  std::array<float, 8> gpu_rope{};
+  if (!CudaOk(cudaMemcpy(gpu_rope.data(), device_rope.get(), device_rope.bytes(), cudaMemcpyDeviceToHost),
+              "copy RoPE output")) return;
+  for (std::size_t index = 0; index < gpu_rope.size(); ++index) {
+    CUDA_TEST_CHECK(std::fabs(gpu_rope[index] - host_rope[index]) < 2.0e-6F);
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -400,6 +496,7 @@ int main() {
   TestDirectSourceSm120Projection();
   TestMlpElementwiseBridge();
   TestFp8ReferenceAndDirectProjection();
+  TestLocalLayerReferenceOperators();
   if (failures != 0) {
     std::cerr << failures << " CUDA test assertion(s) failed\n";
     return 1;

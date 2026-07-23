@@ -23,6 +23,7 @@ include(CudaArchitectures)
 
 add_library(gem16gb_core STATIC
   src/numeric/fp8.cpp
+  src/numeric/layer.cpp
   src/numeric/nvfp4.cpp
   src/cuda/nvfp4/sm120_layout.cpp
   src/model/checkpoint_loader.cpp
@@ -66,6 +67,8 @@ if(GEM16GB_ENABLE_CUDA)
     src/cuda/fp8/checkpoint_probe.cu
     src/cuda/fp8/reference.cu
     src/cuda/fp8/sm120.cu
+    src/cuda/layer/reference.cu
+    src/cuda/layer/checkpoint_probe.cu
     src/cuda/nvfp4/checkpoint_probe.cu
     src/cuda/nvfp4/mlp.cu
     src/cuda/nvfp4/mlp_checkpoint_probe.cu
@@ -89,6 +92,13 @@ if(GEM16GB_ENABLE_CUDA)
     )
     set_property(SOURCE src/cuda/fp8/sm120.cu APPEND PROPERTY COMPILE_OPTIONS
       -Xcompiler=/wd4211
+    )
+    set_property(SOURCE src/cuda/layer/reference.cu APPEND PROPERTY COMPILE_OPTIONS
+      -Xcompiler=/wd4211
+    )
+    set_property(SOURCE src/cuda/layer/checkpoint_probe.cu APPEND PROPERTY COMPILE_OPTIONS
+      -Xcompiler=/wd4211
+      -diag-suppress=2810
     )
     set_property(SOURCE src/cuda/nvfp4/sm120.cu APPEND PROPERTY COMPILE_OPTIONS
       -Xcompiler=/wd4211
@@ -132,6 +142,7 @@ if(BUILD_TESTING AND GEM16GB_BUILD_TESTS)
   add_executable(gem16gb-unit-tests
     tests/unit/fp8_test.cpp
     tests/unit/json_test.cpp
+    tests/unit/layer_test.cpp
     tests/unit/memory_plan_test.cpp
     tests/unit/nvfp4_test.cpp
     tests/unit/safetensors_test.cpp
