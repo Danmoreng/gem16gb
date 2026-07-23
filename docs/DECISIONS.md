@@ -1,5 +1,23 @@
 # Decisions
 
+## 2026-07-23: Qualify unfused full-layer composition before fusion
+
+Date: 2026-07-23
+Decision: Compose the validated FP8 local-attention and NVFP4 MLP routes into a complete Layer-0 device path before
+introducing fused Q/K/V, Gate/Up, residual, or CUDA Graph implementations. Keep independent CUDA scalar-projection
+and direct SM120 paths alive through the final layer output and expose their quantization-boundary differences.
+Context: Individual operators and sublayers were numerically close, but a quantization boundary can amplify small
+attention differences. A full layer is the smallest executable unit that proves the residual, norm, mixed-format,
+and `layer_scalar` ordering together.
+Alternatives: Begin fusion from isolated kernel results; join sublayers through host memory; wait for tokenizer and
+embedding support before testing full-layer composition.
+Consequences: The characterization deliberately owns two copies of execution buffers and is not a production
+memory plan. It establishes a no-host-roundtrip correctness path and a stable orchestration gate while preserving
+the requirement for a later prompt-derived trusted hidden-state comparison.
+Evidence: The real Layer-0 path produces zero differing bytes at both NVFP4 activation boundaries. Its final
+CUDA-reference/direct-SM120 comparison has maximum absolute error `4.7683716e-6`, RMS error `2.8454761e-7`, and
+cosine similarity `0.9999999999999643`.
+
 ## 2026-07-23: Store final K and V cache states separately
 
 Date: 2026-07-23

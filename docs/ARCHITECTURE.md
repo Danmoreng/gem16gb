@@ -23,8 +23,10 @@ arenas. Decode will eventually use fixed addresses and CUDA Graph replay; it may
 compile code in the token loop.
 
 The model-specific sequence is attention normalization and FP8 projections, specialized local/global attention,
-then NVFP4 MLP projections and residual updates. The tied BF16 embedding/output matrix and exact logit softcap are
-separate critical paths. No executable inference graph exists yet.
+then NVFP4 MLP projections and residual updates. This sequence now exists as an unfused, batch-one Layer-0
+checkpoint characterization with separate CUDA-reference and direct SM120 projection routes. It is not yet the
+arena-backed, graph-captured inference graph. The tied BF16 embedding/output matrix and exact logit softcap remain
+separate critical paths.
 
 ## NVFP4 execution boundary
 
@@ -48,5 +50,6 @@ The attention projections remain a separate dynamic-FP8/per-channel-FP8 path.
 
 The first runtime component now converts parsed model metadata and the authoritative text-only manifest into a
 deterministic 256-byte-aligned base arena. It places immutable weights/model state, scales, and the selected KV
-payload in named regions with checked offsets. Both shared and separate K/V sizes are retained in every result;
-selection is explicit. Execution-specific workspaces will be appended only after their kernel shapes are defined.
+payload in named regions with checked offsets. The required separate K/V size and a diagnostic one-state lower
+bound are retained in every result; shared physical cache selection is rejected. Execution-specific workspaces
+will be appended only after their kernel shapes are defined.

@@ -26,7 +26,7 @@ void Usage(std::ostream& output) {
          << "\n"
          << "Kernel mode (CUDA):\n"
          << "  gem16gb-bench kernel --model <checkpoint-dir>\n"
-         << "      [--projection <gate|up|down|mlp|q|k|v|o|local-attention|global-attention>]\n"
+         << "      [--projection <gate|up|down|mlp|q|k|v|o|local-attention|global-attention|decoder-layer>]\n"
          << "      [--warmups <count>] [--iterations <count>]\n";
 }
 
@@ -121,7 +121,7 @@ int RunKernelMode(int argc, char** argv) {
       if (projection != "gate" && projection != "up" && projection != "down" &&
           projection != "mlp" && projection != "q" && projection != "k" &&
           projection != "v" && projection != "o" && projection != "local-attention" &&
-          projection != "global-attention") {
+          projection != "global-attention" && projection != "decoder-layer") {
         std::cerr << "error: unsupported kernel projection\n";
         return 64;
       }
@@ -147,6 +147,45 @@ int RunKernelMode(int argc, char** argv) {
   }
 
 #if GEM16GB_HAS_CUDA
+  if (projection == "decoder-layer") {
+    auto result = gem16gb::internal::RunLayer0DecoderCheckpointProbe(model_directory);
+    if (!result.ok()) {
+      std::cerr << "error: " << result.status().message() << '\n';
+      return 1;
+    }
+    const auto& probe = result.value();
+    std::cerr << "Complete Layer-0 decoder checkpoint probe\n"
+              << "  path: local attention residual -> pre-MLP RMSNorm -> NVFP4 Gate/Up -> "
+                 "GELU-tanh -> NVFP4 Down -> post-MLP RMSNorm -> residual -> layer scalar\n"
+              << "  context: " << probe.context_tokens << " tokens\n"
+              << "  MLP-input mismatched bytes: " << probe.mlp_input_mismatched_bytes << '\n'
+              << "  Down-input mismatched bytes: " << probe.down_input_mismatched_bytes << '\n'
+              << "  reference/native max abs: " << probe.reference_native_max_abs << '\n'
+              << "  reference/native cosine: " << probe.reference_native_cosine << '\n';
+    std::cout << std::setprecision(17)
+              << "{\"schema_version\":1,\"status\":\"characterization\","
+              << "\"benchmark_qualified\":false,\"mode\":\"kernel\",\"fallbacks\":0,"
+              << "\"operator\":\"layer0_decoder\",\"precision\":\"fp8_attention_nvfp4_mlp\","
+              << "\"context_tokens\":" << probe.context_tokens
+              << ",\"source_layout_direct\":true,\"persistent_repack_bytes\":0,"
+              << "\"no_host_roundtrip_between_sublayers\":true,\"layer_scalar_applied\":"
+              << (probe.layer_scalar_applied ? "true" : "false")
+              << ",\"mlp_input_mismatched_bytes\":" << probe.mlp_input_mismatched_bytes
+              << ",\"down_input_mismatched_bytes\":" << probe.down_input_mismatched_bytes
+              << ",\"device_bytes\":" << probe.device_bytes
+              << ",\"error\":{\"reference_native_max_abs\":"
+              << probe.reference_native_max_abs << ",\"reference_native_rms\":"
+              << probe.reference_native_rms << ",\"reference_native_cosine\":"
+              << probe.reference_native_cosine << "},\"samples\":[";
+    for (std::size_t index = 0; index < probe.samples.size(); ++index) {
+      if (index != 0) std::cout << ',';
+      const auto& sample = probe.samples[index];
+      std::cout << "{\"element\":" << sample.element << ",\"cuda_reference\":"
+                << sample.cuda_reference << ",\"sm120_direct\":" << sample.sm120_direct << '}';
+    }
+    std::cout << "]}\n";
+    return 0;
+  }
   if (projection == "global-attention") {
     auto result = gem16gb::internal::RunLayer5GlobalAttentionCheckpointProbe(model_directory);
     if (!result.ok()) {

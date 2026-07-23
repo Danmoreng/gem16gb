@@ -13,12 +13,13 @@ approximately 16 GB of VRAM. The first model is the mixed FP8/NVFP4
   exports JSON.
 - Host parser tests work on Linux and Windows without CUDA. Linux also has opt-in ASan/UBSan builds.
 - `gem16gb-bench memory` builds an aligned, deterministic base arena from the real text-only tensor inventory and
-  reports both shared and separate K/V cache sizes for every context profile.
+  reports the required separate K/V cache plus the one-state diagnostic lower bound for every context profile.
 - The exact host NVFP4 codec covers E2M1, E4M3FN, dynamic-local activation quantization, compressed-tensors global
   divisors, and a binary64 projection oracle with pinned-checkpoint byte fixtures.
 - The CUDA build contains an explicit correctness-only W4A4 projection and an experimental direct-source SM120a
-  projection. Synthetic tests prove CUDA intrinsic agreement and native block-scaled MMA output, but no complete
-  layer or model path is qualified yet.
+  projection. A complete real-checkpoint Layer-0 characterization now composes FP8 local attention and the NVFP4
+  MLP without a host roundtrip or persistent weight repack. It is a correctness characterization, not yet a
+  trusted-hidden-state or performance qualification.
 
 Inference and benchmarks do **not** work yet. `gem16gb-run` and `gem16gb-bench` fail visibly and never fall back to a
 higher precision path.
@@ -101,18 +102,34 @@ The equivalent Windows command is:
 
 ## Plan memory
 
-K/V sharing is not assumed silently. Select the intended storage explicitly; the JSON result also contains the
-alternative size:
+Final K and V states require separate storage because their normalization and RoPE paths differ. Select it
+explicitly; the JSON result retains the one-state byte count only as an audit lower bound:
 
 ```powershell
 .\build\Windows\host-debug\bin\gem16gb-bench.exe memory `
   --model .\models\checkpoints\unsloth-gemma-4-12b-it-NVFP4-b1f6497 `
   --profile long `
-  --kv-storage shared
+  --kv-storage separate
 ```
 
 The current base plan covers immutable text weights, scales, and KV payload. Activation, graph, sampling, kernel,
 and prefill workspaces remain explicitly marked as unplanned rather than being estimated without an execution plan.
+
+## Validate real-checkpoint layer assembly
+
+After a Blackwell CUDA build, run all three real-checkpoint characterization gates with one cross-platform tool:
+
+```powershell
+python .\tools\validate_layer_checkpoint.py `
+  --bench .\build\Windows\blackwell-release\bin\gem16gb-bench.exe `
+  --model .\models\checkpoints\unsloth-gemma-4-12b-it-NVFP4-b1f6497 `
+  --output .\build\Windows\blackwell-release\layer-checkpoint-validation.json
+```
+
+This executes Layer-0 local attention, Layer-5 full attention, and the complete Layer-0 decoder characterization.
+It rejects fallbacks, persistent repacks, missing layer-scalar execution, host roundtrips between sublayers, and
+divergent NVFP4 activation bytes. It deliberately does not invent a model-quality tolerance before the trusted
+hidden-state distribution exists.
 
 ## Hardware and limitations
 

@@ -20,6 +20,9 @@ of the correctness and native-kernel gates below.
 - Assemble Gate/Up, GELU-tanh product, Down, and residual without weakening the now-complete real-checkpoint proof:
   all three Layer-0 shapes consume source weight and scale storage directly, CPU/GPU activation bytes match exactly,
   and CUDA reference/native output differences are at most `1.1920929e-7` in the characterization fixture.
+- Preserve the now-complete unfused Layer-0 device chain while replacing its deterministic hidden/cache fixture
+  with prompt-derived trusted Layer-0 input, output, and K/V state. Both NVFP4 activation boundaries currently
+  remain byte-identical between CUDA-reference and direct SM120 execution.
 - Use the retained direct vLLM characterization as a native-format performance reference. It is 1.66x–2.34x ahead
   of the patched llama.cpp candidate in prefill and 1.25x–1.26x ahead in decode through 8K, but BF16 KV capacity,
   timing-boundary differences, and autotuning fallbacks keep it from being an accepted parity baseline.
@@ -49,9 +52,11 @@ The llama.cpp benchmark is deliberately before engine kernel optimization, but a
 6. Continue tuning the implemented SM120a `m16n8k64` decode projection for `T=1`; disassembly already proves
    `OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X`. Compare it against a bandwidth-oriented packed-NVFP4 SIMT/GEMV candidate
    before declaring the production winner.
-7. The correctness-first Layer-0 MLP chain now implements Gate/Up, Gemma GELU-tanh product, Down, and residual with
-   two exact CPU/CUDA NVFP4 quantization boundaries. Next compare it with trusted layer golden data, then fuse
-   launches and remeasure without using the isolated hot-cache numbers as a layer estimate.
+7. The correctness-first Layer-0 MLP chain now implements Gate/Up, Gemma GELU-tanh product, Down, post-MLP norm,
+   residual, and layer scalar as part of the complete device-resident decoder-layer characterization. Both NVFP4
+   activation boundaries remain byte-identical across its reference/native paths. Next compare it with trusted
+   prompt-derived layer data, then fuse launches and remeasure without using isolated hot-cache numbers as a layer
+   estimate.
 8. Add a separate native prefill plan, initially qualified against pinned CUTLASS/cuBLASLt block-scaled GEMM. Do
    not reuse the decode plan merely for implementation convenience.
 9. The checkpoint's FP8 Q/K/V/O projection path is implemented with an independent CPU oracle, CUDA reference,
@@ -59,10 +64,10 @@ The llama.cpp benchmark is deliberately before engine kernel optimization, but a
    input RMSNorm, Q/K/V, per-head Q/K and scale-free V normalization, RoPE, separate K/V append/read, FP32 softmax,
    O projection, post-attention RMSNorm, and residual over a deterministic 32-token cache. The distinct real
    Layer-5 full-attention route now reuses the raw K projection for V, applies learned K norm plus proportional RoPE
-   separately from scale-free V norm, and proves that the final cache states cannot share storage. Next connect the
-   validated attention and MLP sublayers into a trusted-hidden-state Layer-0 golden. Follow ninfer's useful
-   split-output planning pattern for combined projections while retaining this checkpoint's E4M3/BF16 scale
-   contract.
+   separately from scale-free V norm, and proves that the final cache states cannot share storage. The validated
+   Layer-0 attention and MLP sublayers are now connected without a host roundtrip. Next replace the deterministic
+   hidden/cache inputs with a trusted prompt-derived Layer-0 fixture. Follow ninfer's useful split-output planning
+   pattern for combined projections while retaining this checkpoint's E4M3/BF16 scale contract.
 10. Complete execution-workspace planning and add specialized attention, KV cache, decode fusion, and CUDA Graph
    replay only after the unfused model passes layer, logit, and generation gates.
 11. Validate 64K, then 128K context. MTP and multimodal work remain later milestones.

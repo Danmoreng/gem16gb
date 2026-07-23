@@ -63,6 +63,21 @@ maximum absolute error `4.5299530e-6`, RMS error `5.5268314e-7`, and cosine simi
 `0.9999999999999085`. This also proves that `attention_k_eq_v` permits projection reuse but not shared physical
 storage of the final K/V cache.
 
+The complete Layer-0 decoder characterization now keeps the local-attention residual on device and continues
+through pre-feedforward RMSNorm, dynamic NVFP4 input quantization, Gate/Up, GELU-tanh product, Down-input
+quantization, Down, post-feedforward RMSNorm, the second residual update, and `layer_scalar`. It binds all real
+Layer-0 FP8, NVFP4, BF16 norm, and scalar tensors directly from the checkpoint. The CUDA scalar-projection and
+direct SM120 routes produce zero differing bytes at both NVFP4 activation boundaries. Their final 3,840-element
+outputs have maximum absolute difference `4.7683716e-6`, RMS difference `2.8454761e-7`, and cosine similarity
+`0.9999999999999643`. The probe owns 148,639,086 device bytes because it deliberately retains two complete
+execution paths for comparison; this is not a production workspace or peak-VRAM estimate.
+
+`tools/validate_layer_checkpoint.py` runs the local-attention, full-attention, and complete-decoder probes and
+exports one combined JSON record. It enforces structural correctness gates but intentionally applies no model-wide
+numeric tolerance. The next trusted fixture must use a real token sequence and contain the Layer-0 input, resulting
+Layer-0 output, and matching K/V state needed to reproduce the selected decode position. The current deterministic
+synthetic-cache characterization cannot honestly be compared directly with a prompt-derived hidden state.
+
 Reproduce the instruction check with:
 
 ```bash

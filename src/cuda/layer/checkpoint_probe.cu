@@ -4,6 +4,8 @@
 #include "cuda/fp8/sm120.h"
 #include "cuda/layer/reference.h"
 #include "cuda/nvfp4/mlp.h"
+#include "cuda/nvfp4/reference.h"
+#include "cuda/nvfp4/sm120.h"
 #include "gem16gb/model.h"
 #include "platform/mapped_file.h"
 
@@ -11,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -24,6 +27,7 @@ namespace gem16gb::internal {
 namespace {
 
 constexpr std::uint64_t kHidden = 3840;
+constexpr std::uint64_t kIntermediate = 15360;
 constexpr std::uint64_t kQueryHeads = 16;
 constexpr std::uint64_t kContextTokens = 32;
 constexpr float kEpsilon = 1.0e-6F;
@@ -116,6 +120,67 @@ Result<std::span<const std::uint8_t>> BindBf16(const ModelManifest& manifest,
   return TensorBytes(mapped, *tensor);
 }
 
+Result<float> ScalarF32(const MappedFile& mapped, const TensorInfo& tensor) {
+  auto bytes = TensorBytes(mapped, tensor);
+  if (!bytes.ok()) return bytes.status();
+  if (tensor.storage_dtype != "F32" || bytes.value().size() != sizeof(float)) {
+    return Error(StatusCode::kDataLoss, "expected scalar F32 tensor: " + tensor.name);
+  }
+  const auto data = bytes.value();
+  const std::uint32_t word = static_cast<std::uint32_t>(data[0]) |
+                             (static_cast<std::uint32_t>(data[1]) << 8U) |
+                             (static_cast<std::uint32_t>(data[2]) << 16U) |
+                             (static_cast<std::uint32_t>(data[3]) << 24U);
+  const float value = std::bit_cast<float>(word);
+  if (!std::isfinite(value) || value <= 0.0F) {
+    return Error(StatusCode::kDataLoss,
+                 "NVFP4 global divisor must be positive and finite: " + tensor.name);
+  }
+  return value;
+}
+
+struct HostNvfp4Binding {
+  std::span<const std::uint8_t> packed_weight;
+  std::span<const std::uint8_t> weight_scales;
+  float input_divisor = 0.0F;
+  float weight_divisor = 0.0F;
+  std::uint64_t rows = 0;
+  std::uint64_t contracting = 0;
+};
+
+Result<HostNvfp4Binding> BindNvfp4(const ModelManifest& manifest, const MappedFile& mapped,
+                                  const std::string& base, const std::string& projection,
+                                  std::uint64_t rows, std::uint64_t contracting) {
+  const std::string name = base + "mlp." + projection + "_proj";
+  const TensorInfo* packed = FindTensor(manifest, name + ".weight_packed");
+  const TensorInfo* scales = FindTensor(manifest, name + ".weight_scale");
+  const TensorInfo* input_divisor = FindTensor(manifest, name + ".input_global_scale");
+  const TensorInfo* weight_divisor = FindTensor(manifest, name + ".weight_global_scale");
+  if (packed == nullptr || scales == nullptr || input_divisor == nullptr ||
+      weight_divisor == nullptr) {
+    return Error(StatusCode::kNotFound, "missing NVFP4 tensor family: " + name);
+  }
+  if (packed->logical_shape != std::vector<std::uint64_t>{rows, contracting} ||
+      packed->storage_dtype != "U8" ||
+      scales->shape != std::vector<std::uint64_t>{rows, contracting / 16U} ||
+      scales->storage_dtype != "F8_E4M3" || packed->source_shard != "model.safetensors" ||
+      scales->source_shard != packed->source_shard ||
+      input_divisor->source_shard != packed->source_shard ||
+      weight_divisor->source_shard != packed->source_shard) {
+    return Error(StatusCode::kDataLoss, "unexpected NVFP4 tensor geometry: " + name);
+  }
+  auto packed_bytes = TensorBytes(mapped, *packed);
+  auto scale_bytes = TensorBytes(mapped, *scales);
+  auto input_value = ScalarF32(mapped, *input_divisor);
+  auto weight_value = ScalarF32(mapped, *weight_divisor);
+  if (!packed_bytes.ok()) return packed_bytes.status();
+  if (!scale_bytes.ok()) return scale_bytes.status();
+  if (!input_value.ok()) return input_value.status();
+  if (!weight_value.ok()) return weight_value.status();
+  return HostNvfp4Binding{packed_bytes.value(), scale_bytes.value(), input_value.value(),
+                          weight_value.value(), rows, contracting};
+}
+
 template <typename T>
 class DeviceBuffer {
  public:
@@ -147,6 +212,15 @@ struct DeviceFp8Binding {
   std::uint64_t contracting = 0;
 };
 
+struct DeviceNvfp4Binding {
+  DeviceBuffer<std::uint8_t> packed_weight;
+  DeviceBuffer<std::uint8_t> weight_scales;
+  float input_divisor = 0.0F;
+  float weight_divisor = 0.0F;
+  std::uint64_t rows = 0;
+  std::uint64_t contracting = 0;
+};
+
 Status UploadBinding(const HostFp8Binding& host, DeviceFp8Binding& device) {
   device.rows = host.rows;
   device.contracting = host.contracting;
@@ -160,6 +234,24 @@ Status UploadBinding(const HostFp8Binding& host, DeviceFp8Binding& device) {
   error = cudaMemcpy(device.scales.get(), host.scales.data(), host.scales.size(),
                      cudaMemcpyHostToDevice);
   return error == cudaSuccess ? Status::Ok() : CudaFailure("copy FP8 scales", error);
+}
+
+Status UploadBinding(const HostNvfp4Binding& host, DeviceNvfp4Binding& device) {
+  device.input_divisor = host.input_divisor;
+  device.weight_divisor = host.weight_divisor;
+  device.rows = host.rows;
+  device.contracting = host.contracting;
+  Status status =
+      device.packed_weight.Allocate(host.packed_weight.size(), "allocate NVFP4 weight");
+  if (!status.ok()) return status;
+  status = device.weight_scales.Allocate(host.weight_scales.size(), "allocate NVFP4 scales");
+  if (!status.ok()) return status;
+  cudaError_t error = cudaMemcpy(device.packed_weight.get(), host.packed_weight.data(),
+                                 host.packed_weight.size(), cudaMemcpyHostToDevice);
+  if (error != cudaSuccess) return CudaFailure("copy NVFP4 weight", error);
+  error = cudaMemcpy(device.weight_scales.get(), host.weight_scales.data(),
+                     host.weight_scales.size(), cudaMemcpyHostToDevice);
+  return error == cudaSuccess ? Status::Ok() : CudaFailure("copy NVFP4 scales", error);
 }
 
 std::vector<float> DeterministicHidden() {
@@ -199,6 +291,21 @@ Status LaunchProjection(ProjectionPath path, const std::uint8_t* activation,
   return LaunchFp8Sm120DirectProjection(activation, activation_scale, binding.weight.get(),
                                        binding.scales.get(), output, binding.rows,
                                        binding.contracting, nullptr);
+}
+
+Status LaunchProjection(ProjectionPath path, const std::uint8_t* packed_activation,
+                        const std::uint8_t* activation_scales,
+                        const DeviceNvfp4Binding& binding, float* output) {
+  if (path == ProjectionPath::kReference) {
+    return LaunchNvfp4ReferenceProjection(
+        packed_activation, activation_scales, binding.packed_weight.get(),
+        binding.weight_scales.get(), output, binding.rows, binding.contracting,
+        binding.input_divisor, binding.weight_divisor, nullptr);
+  }
+  return LaunchNvfp4Sm120DirectProjection(
+      packed_activation, activation_scales, binding.packed_weight.get(),
+      binding.weight_scales.get(), output, binding.rows, binding.contracting,
+      binding.input_divisor, binding.weight_divisor, nullptr);
 }
 
 struct PathBuffers {
@@ -247,6 +354,110 @@ std::uint64_t PathBytes(const PathBuffers& path) {
       path.value_cache.bytes() + path.scores.bytes() + path.attention.bytes() +
       path.o_activation.bytes() + path.o_scale.bytes() + path.o_output.bytes() +
       path.post_norm.bytes() + path.final.bytes());
+}
+
+struct DecoderTailBuffers {
+  DeviceBuffer<float> pre_mlp_norm;
+  DeviceBuffer<std::uint8_t> mlp_input_packed;
+  DeviceBuffer<std::uint8_t> mlp_input_scales;
+  DeviceBuffer<float> gate_output;
+  DeviceBuffer<float> up_output;
+  DeviceBuffer<float> product;
+  DeviceBuffer<std::uint8_t> down_input_packed;
+  DeviceBuffer<std::uint8_t> down_input_scales;
+  DeviceBuffer<float> down_output;
+  DeviceBuffer<float> post_mlp_norm;
+  DeviceBuffer<float> final;
+};
+
+Status AllocateDecoderTail(DecoderTailBuffers& tail) {
+  for (const Status status : {
+           tail.pre_mlp_norm.Allocate(kHidden, "allocate pre-MLP norm"),
+           tail.mlp_input_packed.Allocate(kHidden / 2U, "allocate MLP input packed"),
+           tail.mlp_input_scales.Allocate(kHidden / 16U, "allocate MLP input scales"),
+           tail.gate_output.Allocate(kIntermediate, "allocate Gate output"),
+           tail.up_output.Allocate(kIntermediate, "allocate Up output"),
+           tail.product.Allocate(kIntermediate, "allocate MLP product"),
+           tail.down_input_packed.Allocate(kIntermediate / 2U, "allocate Down input packed"),
+           tail.down_input_scales.Allocate(kIntermediate / 16U,
+                                           "allocate Down input scales"),
+           tail.down_output.Allocate(kHidden, "allocate Down output"),
+           tail.post_mlp_norm.Allocate(kHidden, "allocate post-MLP norm"),
+           tail.final.Allocate(kHidden, "allocate decoder-layer output"),
+       }) {
+    if (!status.ok()) return status;
+  }
+  return Status::Ok();
+}
+
+std::uint64_t DecoderTailBytes(const DecoderTailBuffers& tail) {
+  return static_cast<std::uint64_t>(
+      tail.pre_mlp_norm.bytes() + tail.mlp_input_packed.bytes() +
+      tail.mlp_input_scales.bytes() + tail.gate_output.bytes() + tail.up_output.bytes() +
+      tail.product.bytes() + tail.down_input_packed.bytes() +
+      tail.down_input_scales.bytes() + tail.down_output.bytes() +
+      tail.post_mlp_norm.bytes() + tail.final.bytes());
+}
+
+Status RunDecoderTail(ProjectionPath projection_path, DecoderTailBuffers& tail,
+                      const float* attention_residual,
+                      const std::uint16_t* pre_mlp_norm_weight,
+                      const std::uint16_t* post_mlp_norm_weight,
+                      const std::uint16_t* layer_scalar,
+                      const DeviceNvfp4Binding& gate_binding,
+                      const DeviceNvfp4Binding& up_binding,
+                      const DeviceNvfp4Binding& down_binding) {
+  Status status = LaunchRmsNorm(attention_residual, pre_mlp_norm_weight,
+                                tail.pre_mlp_norm.get(), 1, kHidden, kEpsilon, nullptr);
+  if (!status.ok()) return status;
+  status = LaunchNvfp4ReferenceActivationQuantization(
+      tail.pre_mlp_norm.get(), tail.mlp_input_packed.get(), tail.mlp_input_scales.get(),
+      kHidden, gate_binding.input_divisor, nullptr);
+  if (!status.ok()) return status;
+  status = LaunchProjection(projection_path, tail.mlp_input_packed.get(),
+                            tail.mlp_input_scales.get(), gate_binding,
+                            tail.gate_output.get());
+  if (!status.ok()) return status;
+  status = LaunchProjection(projection_path, tail.mlp_input_packed.get(),
+                            tail.mlp_input_scales.get(), up_binding, tail.up_output.get());
+  if (!status.ok()) return status;
+  status = LaunchGeluTanhProduct(tail.gate_output.get(), tail.up_output.get(),
+                                 tail.product.get(), kIntermediate, nullptr);
+  if (!status.ok()) return status;
+  status = LaunchNvfp4ReferenceActivationQuantization(
+      tail.product.get(), tail.down_input_packed.get(), tail.down_input_scales.get(),
+      kIntermediate, down_binding.input_divisor, nullptr);
+  if (!status.ok()) return status;
+  status = LaunchProjection(projection_path, tail.down_input_packed.get(),
+                            tail.down_input_scales.get(), down_binding,
+                            tail.down_output.get());
+  if (!status.ok()) return status;
+  status = LaunchRmsNorm(tail.down_output.get(), post_mlp_norm_weight,
+                         tail.post_mlp_norm.get(), 1, kHidden, kEpsilon, nullptr);
+  if (!status.ok()) return status;
+  status = LaunchAddResidual(tail.post_mlp_norm.get(), attention_residual,
+                             tail.final.get(), kHidden, nullptr);
+  if (!status.ok()) return status;
+  return LaunchScale(tail.final.get(), layer_scalar, kHidden, nullptr);
+}
+
+Result<std::uint64_t> CountMismatchedBytes(const DeviceBuffer<std::uint8_t>& left,
+                                           const DeviceBuffer<std::uint8_t>& right) {
+  if (left.bytes() != right.bytes()) {
+    return Error(StatusCode::kInternal, "mismatched comparison-buffer extents");
+  }
+  std::vector<std::uint8_t> host_left(left.bytes());
+  std::vector<std::uint8_t> host_right(right.bytes());
+  cudaError_t error =
+      cudaMemcpy(host_left.data(), left.get(), left.bytes(), cudaMemcpyDeviceToHost);
+  if (error != cudaSuccess) return CudaFailure("copy left comparison buffer", error);
+  error = cudaMemcpy(host_right.data(), right.get(), right.bytes(), cudaMemcpyDeviceToHost);
+  if (error != cudaSuccess) return CudaFailure("copy right comparison buffer", error);
+  std::uint64_t mismatches = 0;
+  for (std::size_t index = 0; index < host_left.size(); ++index) {
+    mismatches += host_left[index] == host_right[index] ? 0U : 1U;
+  }
+  return mismatches;
 }
 
 Status RunPath(const AttentionGeometry& geometry, ProjectionPath projection_path, PathBuffers& path,
@@ -328,8 +539,9 @@ Status RunPath(const AttentionGeometry& geometry, ProjectionPath projection_path
 
 namespace {
 
-Result<AttentionCheckpointProbeResult> RunAttentionCheckpointProbe(
-    const std::filesystem::path& model_directory, const AttentionGeometry& geometry) {
+Result<LayerCheckpointProbeResult> RunLayerCheckpointProbe(
+    const std::filesystem::path& model_directory, const AttentionGeometry& geometry,
+    bool include_mlp) {
   auto manifest = InspectCheckpoint({model_directory, true});
   if (!manifest.ok()) return manifest.status();
   auto mapped = MappedFile::Open(model_directory / "model.safetensors");
@@ -364,6 +576,42 @@ Result<AttentionCheckpointProbeResult> RunAttentionCheckpointProbe(
   if (!k_norm.ok()) return k_norm.status();
   if (!post_norm.ok()) return post_norm.status();
 
+  HostNvfp4Binding gate, up, down;
+  std::span<const std::uint8_t> pre_mlp_norm;
+  std::span<const std::uint8_t> post_mlp_norm;
+  std::span<const std::uint8_t> layer_scalar;
+  if (include_mlp) {
+    auto bound_gate = BindNvfp4(manifest.value(), mapped.value(), base, "gate", kIntermediate,
+                                kHidden);
+    auto bound_up = BindNvfp4(manifest.value(), mapped.value(), base, "up", kIntermediate,
+                              kHidden);
+    auto bound_down = BindNvfp4(manifest.value(), mapped.value(), base, "down", kHidden,
+                                kIntermediate);
+    auto bound_pre_mlp = BindBf16(manifest.value(), mapped.value(),
+                                  base + "pre_feedforward_layernorm.weight", kHidden);
+    auto bound_post_mlp = BindBf16(manifest.value(), mapped.value(),
+                                   base + "post_feedforward_layernorm.weight", kHidden);
+    auto bound_layer_scalar =
+        BindBf16(manifest.value(), mapped.value(), base + "layer_scalar", 1);
+    if (!bound_gate.ok()) return bound_gate.status();
+    if (!bound_up.ok()) return bound_up.status();
+    if (!bound_down.ok()) return bound_down.status();
+    if (!bound_pre_mlp.ok()) return bound_pre_mlp.status();
+    if (!bound_post_mlp.ok()) return bound_post_mlp.status();
+    if (!bound_layer_scalar.ok()) return bound_layer_scalar.status();
+    gate = bound_gate.value();
+    up = bound_up.value();
+    down = bound_down.value();
+    pre_mlp_norm = bound_pre_mlp.value();
+    post_mlp_norm = bound_post_mlp.value();
+    layer_scalar = bound_layer_scalar.value();
+    if (std::bit_cast<std::uint32_t>(gate.input_divisor) !=
+        std::bit_cast<std::uint32_t>(up.input_divisor)) {
+      return Error(StatusCode::kDataLoss,
+                   "Layer-0 Gate and Up input global divisors are not identical");
+    }
+  }
+
   cudaDeviceProp properties{};
   cudaError_t error = cudaGetDeviceProperties(&properties, 0);
   if (error != cudaSuccess) return CudaFailure("cudaGetDeviceProperties", error);
@@ -381,6 +629,13 @@ Result<AttentionCheckpointProbeResult> RunAttentionCheckpointProbe(
     if (!upload_v.ok()) return upload_v;
     device_v_pointer = &device_v;
   }
+  DeviceNvfp4Binding device_gate, device_up, device_down;
+  if (include_mlp) {
+    for (const Status status : {UploadBinding(gate, device_gate), UploadBinding(up, device_up),
+                                UploadBinding(down, device_down)}) {
+      if (!status.ok()) return status;
+    }
+  }
   DeviceBuffer<float> hidden, normalized;
   DeviceBuffer<std::uint8_t> activation;
   DeviceBuffer<float> activation_scale;
@@ -395,6 +650,16 @@ Result<AttentionCheckpointProbeResult> RunAttentionCheckpointProbe(
       k_norm_weight.Allocate(geometry.head_dimension, "allocate K norm weight"),
       post_norm_weight.Allocate(kHidden, "allocate post norm weight")})
     if (!status.ok()) return status;
+  DeviceBuffer<std::uint16_t> pre_mlp_norm_weight, post_mlp_norm_weight, layer_scalar_weight;
+  if (include_mlp) {
+    for (const Status status : {
+             pre_mlp_norm_weight.Allocate(kHidden, "allocate pre-MLP norm weight"),
+             post_mlp_norm_weight.Allocate(kHidden, "allocate post-MLP norm weight"),
+             layer_scalar_weight.Allocate(1, "allocate layer scalar"),
+         }) {
+      if (!status.ok()) return status;
+    }
+  }
   const auto host_hidden = DeterministicHidden();
   const auto host_keys = DeterministicCache(geometry, false);
   const auto host_values = DeterministicCache(geometry, true);
@@ -407,6 +672,18 @@ Result<AttentionCheckpointProbeResult> RunAttentionCheckpointProbe(
   for (const auto& copy : norm_copies) {
     error = cudaMemcpy(copy.first, copy.second.data(), copy.second.size(), cudaMemcpyHostToDevice);
     if (error != cudaSuccess) return CudaFailure("copy norm weight", error);
+  }
+  if (include_mlp) {
+    const std::array<std::pair<void*, std::span<const std::uint8_t>>, 3> tail_copies = {{
+        {pre_mlp_norm_weight.get(), pre_mlp_norm},
+        {post_mlp_norm_weight.get(), post_mlp_norm},
+        {layer_scalar_weight.get(), layer_scalar},
+    }};
+    for (const auto& copy : tail_copies) {
+      error = cudaMemcpy(copy.first, copy.second.data(), copy.second.size(),
+                         cudaMemcpyHostToDevice);
+      if (error != cudaSuccess) return CudaFailure("copy decoder-tail weight", error);
+    }
   }
   error = cudaMemcpy(hidden.get(), host_hidden.data(), hidden.bytes(), cudaMemcpyHostToDevice);
   if (error != cudaSuccess) return CudaFailure("copy hidden", error);
@@ -432,25 +709,64 @@ Result<AttentionCheckpointProbeResult> RunAttentionCheckpointProbe(
                    activation.get(), activation_scale.get(), hidden.get(), q_norm_weight.get(),
                    k_norm_weight.get(), post_norm_weight.get(), host_keys, host_values);
   if (!status.ok()) return status;
+  DecoderTailBuffers reference_tail, native_tail;
+  const float* reference_output = reference.final.get();
+  const float* native_output = native.final.get();
+  if (include_mlp) {
+    status = AllocateDecoderTail(reference_tail);
+    if (!status.ok()) return status;
+    status = AllocateDecoderTail(native_tail);
+    if (!status.ok()) return status;
+    status = RunDecoderTail(ProjectionPath::kReference, reference_tail, reference.final.get(),
+                            pre_mlp_norm_weight.get(), post_mlp_norm_weight.get(),
+                            layer_scalar_weight.get(), device_gate, device_up, device_down);
+    if (!status.ok()) return status;
+    status = RunDecoderTail(ProjectionPath::kSm120, native_tail, native.final.get(),
+                            pre_mlp_norm_weight.get(), post_mlp_norm_weight.get(),
+                            layer_scalar_weight.get(), device_gate, device_up, device_down);
+    if (!status.ok()) return status;
+    reference_output = reference_tail.final.get();
+    native_output = native_tail.final.get();
+  }
   error = cudaDeviceSynchronize();
-  if (error != cudaSuccess) return CudaFailure("attention probe synchronize", error);
+  if (error != cudaSuccess) return CudaFailure("layer probe synchronize", error);
   std::vector<float> host_reference(kHidden), host_native(kHidden);
-  error = cudaMemcpy(host_reference.data(), reference.final.get(), reference.final.bytes(),
+  error = cudaMemcpy(host_reference.data(), reference_output, host_reference.size() * sizeof(float),
                      cudaMemcpyDeviceToHost);
-  if (error != cudaSuccess) return CudaFailure("copy reference attention output", error);
-  error = cudaMemcpy(host_native.data(), native.final.get(), native.final.bytes(),
+  if (error != cudaSuccess) return CudaFailure("copy reference layer output", error);
+  error = cudaMemcpy(host_native.data(), native_output, host_native.size() * sizeof(float),
                      cudaMemcpyDeviceToHost);
-  if (error != cudaSuccess) return CudaFailure("copy native attention output", error);
+  if (error != cudaSuccess) return CudaFailure("copy native layer output", error);
 
-  AttentionCheckpointProbeResult result;
+  LayerCheckpointProbeResult result;
   result.layer = geometry.layer;
   result.context_tokens = kContextTokens;
   result.global_attention = geometry.proportional_rope;
   result.reused_k_projection_for_v = geometry.reuse_k_projection_for_v;
+  result.includes_mlp = include_mlp;
+  result.layer_scalar_applied = include_mlp;
+  if (include_mlp) {
+    auto input_packed_mismatches = CountMismatchedBytes(
+        reference_tail.mlp_input_packed, native_tail.mlp_input_packed);
+    auto input_scale_mismatches = CountMismatchedBytes(
+        reference_tail.mlp_input_scales, native_tail.mlp_input_scales);
+    auto down_packed_mismatches = CountMismatchedBytes(
+        reference_tail.down_input_packed, native_tail.down_input_packed);
+    auto down_scale_mismatches = CountMismatchedBytes(
+        reference_tail.down_input_scales, native_tail.down_input_scales);
+    if (!input_packed_mismatches.ok()) return input_packed_mismatches.status();
+    if (!input_scale_mismatches.ok()) return input_scale_mismatches.status();
+    if (!down_packed_mismatches.ok()) return down_packed_mismatches.status();
+    if (!down_scale_mismatches.ok()) return down_scale_mismatches.status();
+    result.mlp_input_mismatched_bytes =
+        input_packed_mismatches.value() + input_scale_mismatches.value();
+    result.down_input_mismatched_bytes =
+        down_packed_mismatches.value() + down_scale_mismatches.value();
+  }
   double squared_error = 0.0, dot = 0.0, reference_norm = 0.0, native_norm = 0.0;
   for (std::size_t index = 0; index < host_reference.size(); ++index) {
     if (!std::isfinite(host_reference[index]) || !std::isfinite(host_native[index]))
-      return Error(StatusCode::kDataLoss, "attention probe produced non-finite output");
+      return Error(StatusCode::kDataLoss, "layer probe produced non-finite output");
     const double difference = static_cast<double>(host_reference[index]) - host_native[index];
     result.reference_native_max_abs =
         std::max(result.reference_native_max_abs, std::fabs(difference));
@@ -470,21 +786,32 @@ Result<AttentionCheckpointProbeResult> RunAttentionCheckpointProbe(
       device_k.scales.bytes() + device_v.weight.bytes() + device_v.scales.bytes() +
       device_o.weight.bytes() + device_o.scales.bytes() + hidden.bytes() + normalized.bytes() +
       activation.bytes() + activation_scale.bytes() + input_norm_weight.bytes() +
-      q_norm_weight.bytes() + k_norm_weight.bytes() + post_norm_weight.bytes()) +
-      PathBytes(reference) + PathBytes(native);
+      q_norm_weight.bytes() + k_norm_weight.bytes() + post_norm_weight.bytes() +
+      device_gate.packed_weight.bytes() + device_gate.weight_scales.bytes() +
+      device_up.packed_weight.bytes() + device_up.weight_scales.bytes() +
+      device_down.packed_weight.bytes() + device_down.weight_scales.bytes() +
+      pre_mlp_norm_weight.bytes() + post_mlp_norm_weight.bytes() +
+      layer_scalar_weight.bytes()) +
+      PathBytes(reference) + PathBytes(native) + DecoderTailBytes(reference_tail) +
+      DecoderTailBytes(native_tail);
   return result;
 }
 
 }  // namespace
 
-Result<AttentionCheckpointProbeResult> RunLayer0LocalAttentionCheckpointProbe(
+Result<LayerCheckpointProbeResult> RunLayer0LocalAttentionCheckpointProbe(
     const std::filesystem::path& model_directory) {
-  return RunAttentionCheckpointProbe(model_directory, kLocalGeometry);
+  return RunLayerCheckpointProbe(model_directory, kLocalGeometry, false);
 }
 
-Result<AttentionCheckpointProbeResult> RunLayer5GlobalAttentionCheckpointProbe(
+Result<LayerCheckpointProbeResult> RunLayer5GlobalAttentionCheckpointProbe(
     const std::filesystem::path& model_directory) {
-  return RunAttentionCheckpointProbe(model_directory, kGlobalGeometry);
+  return RunLayerCheckpointProbe(model_directory, kGlobalGeometry, false);
+}
+
+Result<LayerCheckpointProbeResult> RunLayer0DecoderCheckpointProbe(
+    const std::filesystem::path& model_directory) {
+  return RunLayerCheckpointProbe(model_directory, kLocalGeometry, true);
 }
 
 }  // namespace gem16gb::internal
