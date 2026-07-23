@@ -24,6 +24,15 @@ namespace gem16gb::internal {
                                            double theta,
                                            cudaStream_t stream);
 
+[[nodiscard]] Status LaunchProportionalRotaryEmbedding(float* states,
+                                                       std::uint64_t heads,
+                                                       std::uint64_t head_dimension,
+                                                       double rotary_factor,
+                                                       std::uint64_t position,
+                                                       double theta,
+                                                       double scaling_factor,
+                                                       cudaStream_t stream);
+
 [[nodiscard]] Status LaunchAppendKv(const float* key,
                                     const float* value,
                                     float* key_cache,
@@ -35,6 +44,8 @@ namespace gem16gb::internal {
 
 // Correctness-first batch-one decode attention. `scores` is a caller-owned
 // workspace of query_heads * tokens floats and is overwritten with probabilities.
+// Computes grouped-query attention over the exact cache view supplied by the
+// caller. Sliding versus full attention is determined by that view's extent.
 [[nodiscard]] Status LaunchLocalAttentionDecode(const float* query,
                                                 const float* key_cache,
                                                 const float* value_cache,

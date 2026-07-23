@@ -101,6 +101,49 @@ Status ApplyRotaryEmbedding(std::span<float> states,
   return Status::Ok();
 }
 
+Status ApplyProportionalRotaryEmbedding(std::span<float> states,
+                                        std::uint64_t heads,
+                                        std::uint64_t head_dimension,
+                                        double rotary_factor,
+                                        std::uint64_t position,
+                                        double theta,
+                                        double scaling_factor) {
+  std::size_t elements = 0;
+  if (heads == 0U || head_dimension == 0U || head_dimension % 2U != 0U ||
+      !MultiplyFits(heads, head_dimension, elements) || states.size() != elements) {
+    return Invalid("proportional RoPE geometry does not match the state extent");
+  }
+  if (!(rotary_factor > 0.0) || rotary_factor > 1.0 || !std::isfinite(rotary_factor) ||
+      !(theta > 0.0) || !std::isfinite(theta) || !(scaling_factor > 0.0) ||
+      !std::isfinite(scaling_factor)) {
+    return Invalid("proportional RoPE factors and theta must be positive and finite");
+  }
+  const std::uint64_t half = head_dimension / 2U;
+  const std::uint64_t rotating_pairs =
+      static_cast<std::uint64_t>(rotary_factor * static_cast<double>(half));
+  if (rotating_pairs == 0U || rotating_pairs > half) {
+    return Invalid("proportional RoPE factor selects no valid pairs");
+  }
+  for (std::uint64_t head = 0; head < heads; ++head) {
+    const std::size_t base = static_cast<std::size_t>(head * head_dimension);
+    for (std::uint64_t index = 0; index < rotating_pairs; ++index) {
+      const double exponent = (2.0 * static_cast<double>(index)) /
+                              static_cast<double>(head_dimension);
+      const double angle = static_cast<double>(position) /
+                           (std::pow(theta, exponent) * scaling_factor);
+      const double cosine = std::cos(angle);
+      const double sine = std::sin(angle);
+      const std::size_t first = base + static_cast<std::size_t>(index);
+      const std::size_t second = first + static_cast<std::size_t>(half);
+      const double first_value = states[first];
+      const double second_value = states[second];
+      states[first] = static_cast<float>(first_value * cosine - second_value * sine);
+      states[second] = static_cast<float>(second_value * cosine + first_value * sine);
+    }
+  }
+  return Status::Ok();
+}
+
 Result<std::vector<float>> LocalAttentionDecode(std::span<const float> query,
                                                 std::span<const float> key_cache,
                                                 std::span<const float> value_cache,

@@ -8,18 +8,20 @@ scales and aligns every named region to 256 bytes. These remain planned payload 
 For the parsed 48-layer architecture and one-byte FP8 cache, the formula after the local window is full is:
 
 ```text
-local shared K/V = 40 * min(tokens, 1024) * 8 * 256
-global shared K/V = 8 * tokens * 1 * 512
-separate K and V  = 2 * shared K/V
+local one-state lower bound = 40 * min(tokens, 1024) * 8 * 256
+global one-state lower bound = 8 * tokens * 1 * 512
+required separate K and V   = 2 * one-state lower bound
 ```
 
-At 64K, this is 336 MiB for proven shared K/V semantics or 672 MiB if separate K and V storage is required. These
-are formulas, not allocator measurements. Metadata, scale storage, alignment, CUDA context, workspaces, and graph
-pools must be added to future measured reports.
+At 64K, the one-state lower bound is 336 MiB and the required separate K/V payload is 672 MiB. Although
+`attention_k_eq_v=true` reuses the raw full-attention K projection for V, learned K normalization plus RoPE and
+scale-free V normalization produce distinct final cache states. Shared physical storage is therefore rejected.
+These are formulas, not allocator measurements. Metadata, scale storage, alignment, CUDA context, workspaces, and
+graph pools must be added to future measured reports.
 
 The one-byte FP8 payload plans are:
 
-| Profile | Context | Shared K/V | Separate K/V | Known arena, shared | Known arena, separate |
+| Profile | Context | One-state lower bound | Required separate K/V | Invalid shared arena | Selected separate arena |
 |---|---:|---:|---:|---:|---:|
 | `interactive` | 8,192 | 112 MiB | 224 MiB | 8,885.83 MiB | 8,997.83 MiB |
 | `standard` | 32,768 | 208 MiB | 416 MiB | 8,981.83 MiB | 9,189.83 MiB |
@@ -27,7 +29,7 @@ The one-byte FP8 payload plans are:
 | `xlong` | 131,072 | 592 MiB | 1,184 MiB | 9,365.83 MiB | 9,957.83 MiB |
 | `max` | 262,144 | 1,104 MiB | 2,208 MiB | 9,877.83 MiB | 10,981.83 MiB |
 
-Every plan reports both cache possibilities and requires the selected layout explicitly. Checked multiplication,
-addition, and alignment reject integer overflow. Activation A/B, logits, sampling, CUDA Graph, kernel, and prefill
-workspaces remain explicitly unplanned until their execution shapes are defined; `total_arena_bytes` is therefore
-the known base arena, not a peak-VRAM claim.
+Every plan reports both byte formulas for auditability, requires an explicit layout, and accepts only `separate`.
+Checked multiplication, addition, and alignment reject integer overflow. Activation A/B, logits, sampling, CUDA
+Graph, kernel, and prefill workspaces remain explicitly unplanned until their execution shapes are defined;
+`total_arena_bytes` is therefore the known base arena, not a peak-VRAM claim.

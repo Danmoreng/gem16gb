@@ -28,6 +28,18 @@ namespace gem16gb::layer {
     std::uint64_t position,
     double theta);
 
+// Gemma 4 full attention uses proportional RoPE: the frequency denominator and
+// split-half pairing retain the complete head dimension, while only the first
+// `rotary_factor` fraction of pairs receives nonzero frequencies.
+[[nodiscard]] Status ApplyProportionalRotaryEmbedding(
+    std::span<float> states,
+    std::uint64_t heads,
+    std::uint64_t head_dimension,
+    double rotary_factor,
+    std::uint64_t position,
+    double theta,
+    double scaling_factor = 1.0);
+
 // Batch-one decode attention over an already populated K/V cache. Layouts are
 // Q [query_heads, head_dimension] and K/V [tokens, kv_heads, head_dimension].
 // The result is concatenated query-head output [query_heads, head_dimension].

@@ -54,6 +54,15 @@ projection routes produce a final 3,840-element maximum absolute difference of `
 `4.2503101e-6`, and cosine similarity `0.9999999999984577`. This validates operator composition and real tensor
 binding without a persistent repack; it is not yet a trusted-runtime hidden-state golden or a performance result.
 
+The corresponding full-attention characterization now executes the real Layer-5 tensor family with 16 query
+heads, one 512-dimensional KV head, and proportional RoPE. It reuses the raw K projection as the V input because
+the checkpoint has no `v_proj`, then deliberately diverges the states: K receives learned RMSNorm and proportional
+RoPE over the first 25% of rotary frequencies, while V receives scale-free RMSNorm and no RoPE. Over the same
+deterministic 32-token fixture, direct SM120 projections and the independent CUDA scalar route produce final
+maximum absolute error `4.5299530e-6`, RMS error `5.5268314e-7`, and cosine similarity
+`0.9999999999999085`. This also proves that `attention_k_eq_v` permits projection reuse but not shared physical
+storage of the final K/V cache.
+
 Reproduce the instruction check with:
 
 ```bash

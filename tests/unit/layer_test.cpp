@@ -5,6 +5,7 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <vector>
 
 namespace {
 
@@ -46,6 +47,30 @@ void TestRotaryEmbedding() {
   GEM16GB_CHECK(std::fabs(first_norm - original_norm) < 1.0e-5);
 }
 
+void TestProportionalRotaryEmbedding() {
+  std::vector<float> states(512);
+  for (std::size_t index = 0; index < states.size(); ++index) {
+    states[index] = static_cast<float>(index + 1U) * 0.01F;
+  }
+  const auto original = states;
+  GEM16GB_CHECK(gem16gb::layer::ApplyProportionalRotaryEmbedding(
+                    states, 1, 512, 0.25, 31, 1'000'000.0)
+                    .ok());
+  GEM16GB_CHECK(states[0] != original[0]);
+  GEM16GB_CHECK(states[256] != original[256]);
+  GEM16GB_CHECK(states[63] != original[63]);
+  GEM16GB_CHECK(states[319] != original[319]);
+  GEM16GB_CHECK(states[64] == original[64]);
+  GEM16GB_CHECK(states[320] == original[320]);
+  GEM16GB_CHECK(states[255] == original[255]);
+  GEM16GB_CHECK(states[511] == original[511]);
+  const double rotated_norm = static_cast<double>(states[0]) * states[0] +
+                              static_cast<double>(states[256]) * states[256];
+  const double original_norm = static_cast<double>(original[0]) * original[0] +
+                               static_cast<double>(original[256]) * original[256];
+  GEM16GB_CHECK(std::fabs(rotated_norm - original_norm) < 1.0e-5);
+}
+
 void TestGroupedQueryAttention() {
   constexpr std::array<float, 8> query = {
       1.0F, 0.0F, 0.0F, 1.0F, 1.0F, 0.0F, 1.0F, 0.0F};
@@ -69,6 +94,12 @@ void TestInvalidLayerInputs() {
   GEM16GB_CHECK(!gem16gb::layer::RmsNorm(value, {}, 1, 1, 1.0e-6F).ok());
   std::array<float, 4> rope{};
   GEM16GB_CHECK(!gem16gb::layer::ApplyRotaryEmbedding(rope, 1, 4, 3, 0, 10000.0).ok());
+  GEM16GB_CHECK(!gem16gb::layer::ApplyProportionalRotaryEmbedding(
+                     rope, 1, 4, 0.0, 0, 1'000'000.0)
+                     .ok());
+  GEM16GB_CHECK(!gem16gb::layer::ApplyProportionalRotaryEmbedding(
+                     rope, 1, 4, 0.25, 0, 1'000'000.0, 0.0)
+                     .ok());
   GEM16GB_CHECK(!gem16gb::layer::LocalAttentionDecode({}, {}, {}, 16, 8, 256, 0).ok());
 }
 
@@ -77,6 +108,7 @@ void TestInvalidLayerInputs() {
 void RunLayerTests() {
   TestRmsNorm();
   TestRotaryEmbedding();
+  TestProportionalRotaryEmbedding();
   TestGroupedQueryAttention();
   TestInvalidLayerInputs();
 }

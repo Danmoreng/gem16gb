@@ -8,22 +8,28 @@
 
 namespace gem16gb::internal {
 
-struct LocalAttentionProbeSample {
+struct AttentionProbeSample {
   std::uint64_t element = 0;
   float cuda_reference = 0.0F;
   float sm120_direct = 0.0F;
 };
 
-struct LocalAttentionCheckpointProbeResult {
+struct AttentionCheckpointProbeResult {
+  std::uint64_t layer = 0;
   std::uint64_t context_tokens = 0;
   std::uint64_t device_bytes = 0;
+  bool global_attention = false;
+  bool reused_k_projection_for_v = false;
   double reference_native_max_abs = 0.0;
   double reference_native_rms = 0.0;
   double reference_native_cosine = 0.0;
-  std::vector<LocalAttentionProbeSample> samples;
+  std::vector<AttentionProbeSample> samples;
 };
 
-[[nodiscard]] Result<LocalAttentionCheckpointProbeResult>
+[[nodiscard]] Result<AttentionCheckpointProbeResult>
 RunLayer0LocalAttentionCheckpointProbe(const std::filesystem::path& model_directory);
+
+[[nodiscard]] Result<AttentionCheckpointProbeResult>
+RunLayer5GlobalAttentionCheckpointProbe(const std::filesystem::path& model_directory);
 
 }  // namespace gem16gb::internal

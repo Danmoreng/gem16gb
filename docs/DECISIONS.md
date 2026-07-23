@@ -1,5 +1,24 @@
 # Decisions
 
+## 2026-07-23: Store final K and V cache states separately
+
+Date: 2026-07-23
+Decision: Reuse the single full-attention K projection output as the input to both K and V post-processing, but
+always allocate and append separate final K and V cache states. Reject `--kv-storage shared` rather than accepting
+an invalid memory optimization. Continue reporting a one-state byte count only as a diagnostic lower bound.
+Context: The executable Layer-5 path resolves the earlier ambiguity around `attention_k_eq_v=true`. The raw K
+projection is shared, but K then receives its learned per-head RMSNorm and proportional RoPE while V receives a
+scale-free RMSNorm and no RoPE. Their stored values are therefore distinct.
+Alternatives: Physically share the cache because the projection tensor is shared; recompute one state during every
+attention read; leave the option selectable until end-to-end assembly.
+Consequences: The one-byte FP8 cache budget at 64K is 672 MiB rather than 336 MiB. The memory plan remains below the
+16 GB target and now matches the implemented model semantics. Projection reuse still avoids a separate `v_proj`
+weight read and launch on full-attention layers.
+Evidence: The real Layer-5 checkpoint probe binds the absent `v_proj` as a reused raw K projection, applies the two
+distinct post-processing paths, appends both states, and matches the independent CUDA scalar route with maximum
+absolute error `4.5299530e-6`, RMS error `5.5268314e-7`, and cosine similarity
+`0.9999999999999085`.
+
 ## 2026-07-23: Bring up NVFP4 from an exact oracle into separate decode and prefill plans
 
 Date: 2026-07-23
@@ -30,10 +49,12 @@ positive, nonzero E4M3FN bytes with no NaN encoding.
 
 Date: 2026-07-23
 Decision: Build a deterministic 256-byte-aligned base arena from the parsed text-only tensor inventory and context
-metadata. Calculate both shared and separate K/V payloads, require an explicit selection, and leave execution
-workspaces visibly unplanned until kernel shapes define them.
-Context: The checkpoint proves `attention_k_eq_v=true`, but physical shared-cache semantics and workspace sizes have
-not yet been validated by an executable model path. A 16 GB budget cannot tolerate hidden or guessed allocations.
+metadata. Calculate both one-state and separate K/V payloads, require an explicit selection, and leave execution
+workspaces visibly unplanned until kernel shapes define them. The later Layer-5 decision above resolves the storage
+selection to separate K and V.
+Context: At the time, the checkpoint proved `attention_k_eq_v=true`, but physical shared-cache semantics and
+workspace sizes had not yet been validated by an executable model path. A 16 GB budget cannot tolerate hidden or
+guessed allocations.
 Alternatives: Assume shared K/V immediately; reserve budget-table maxima as real allocations; defer all memory work
 until CUDA kernels exist.
 Consequences: Weight, scale, and KV offsets are deterministic and overflow-checked now. Memory reports remain useful

@@ -67,35 +67,45 @@ void RunMemoryPlanTests() {
       .kv_storage = KvStorage::kShared,
   };
   auto shared = BuildMemoryPlan(config, manifest, shared_options);
-  GEM16GB_CHECK(shared.ok());
-  if (shared.ok()) {
-    GEM16GB_CHECK(shared.value().context_profile == "long");
-    GEM16GB_CHECK(shared.value().kv_storage == "shared");
-    GEM16GB_CHECK(shared.value().kv_element_bytes == 1);
-    GEM16GB_CHECK(shared.value().arena_alignment == 256);
-    GEM16GB_CHECK(shared.value().local_layer_count == 40);
-    GEM16GB_CHECK(shared.value().global_layer_count == 8);
-    GEM16GB_CHECK(shared.value().model_weight_bytes == 8'668'020'512);
-    GEM16GB_CHECK(shared.value().scale_bytes == 532'006'016);
-    GEM16GB_CHECK(shared.value().text_only_source_bytes == 9'200'026'528);
-    GEM16GB_CHECK(shared.value().local_shared_kv_bytes == 83'886'080);
-    GEM16GB_CHECK(shared.value().global_shared_kv_bytes == 268'435'456);
-    GEM16GB_CHECK(shared.value().shared_kv_bytes == 352'321'536);
-    GEM16GB_CHECK(shared.value().separate_kv_bytes == 704'643'072);
-    GEM16GB_CHECK(shared.value().selected_kv_bytes == shared.value().shared_kv_bytes);
-    GEM16GB_CHECK(shared.value().regions.size() == 3);
-    for (const auto& region : shared.value().regions) {
+  GEM16GB_CHECK(!shared.ok());
+  if (!shared.ok()) {
+    GEM16GB_CHECK(shared.status().code() == gem16gb::StatusCode::kUnsupported);
+    GEM16GB_CHECK(shared.status().message().find("distinct cache states") != std::string::npos);
+  }
+
+  auto separate_options = shared_options;
+  separate_options.kv_storage = KvStorage::kSeparate;
+  auto separate = BuildMemoryPlan(config, manifest, separate_options);
+  GEM16GB_CHECK(separate.ok());
+  if (separate.ok()) {
+    GEM16GB_CHECK(separate.value().context_profile == "long");
+    GEM16GB_CHECK(separate.value().kv_storage == "separate");
+    GEM16GB_CHECK(separate.value().kv_element_bytes == 1);
+    GEM16GB_CHECK(separate.value().arena_alignment == 256);
+    GEM16GB_CHECK(separate.value().local_layer_count == 40);
+    GEM16GB_CHECK(separate.value().global_layer_count == 8);
+    GEM16GB_CHECK(separate.value().model_weight_bytes == 8'668'020'512);
+    GEM16GB_CHECK(separate.value().scale_bytes == 532'006'016);
+    GEM16GB_CHECK(separate.value().text_only_source_bytes == 9'200'026'528);
+    GEM16GB_CHECK(separate.value().local_shared_kv_bytes == 83'886'080);
+    GEM16GB_CHECK(separate.value().global_shared_kv_bytes == 268'435'456);
+    GEM16GB_CHECK(separate.value().shared_kv_bytes == 352'321'536);
+    GEM16GB_CHECK(separate.value().separate_kv_bytes == 704'643'072);
+    GEM16GB_CHECK(separate.value().selected_kv_bytes == separate.value().separate_kv_bytes);
+    GEM16GB_CHECK(!separate.value().shared_kv_storage_supported);
+    GEM16GB_CHECK(separate.value().regions.size() == 3);
+    for (const auto& region : separate.value().regions) {
       GEM16GB_CHECK(region.offset % 256U == 0);
       GEM16GB_CHECK(region.alignment == 256);
     }
-    GEM16GB_CHECK(shared.value().total_arena_bytes % 256U == 0);
-    GEM16GB_CHECK(shared.value().total_arena_bytes ==
-                  shared.value().text_only_source_bytes + shared.value().selected_kv_bytes +
-                      shared.value().padding_bytes);
-    GEM16GB_CHECK(!shared.value().execution_workspaces_planned);
+    GEM16GB_CHECK(separate.value().total_arena_bytes % 256U == 0);
+    GEM16GB_CHECK(separate.value().total_arena_bytes ==
+                  separate.value().text_only_source_bytes + separate.value().selected_kv_bytes +
+                      separate.value().padding_bytes);
+    GEM16GB_CHECK(!separate.value().execution_workspaces_planned);
 
     std::ostringstream json_output;
-    GEM16GB_CHECK(gem16gb::WriteMemoryPlanJson(shared.value(), json_output).ok());
+    GEM16GB_CHECK(gem16gb::WriteMemoryPlanJson(separate.value(), json_output).ok());
     auto parsed_json = gem16gb::json::Parse(json_output.str());
     GEM16GB_CHECK(parsed_json.ok());
     if (parsed_json.ok()) {
@@ -105,32 +115,24 @@ void RunMemoryPlanTests() {
       GEM16GB_CHECK(total_arena != nullptr);
       GEM16GB_CHECK(workspaces_planned != nullptr);
       GEM16GB_CHECK(fallbacks != nullptr);
-      if (total_arena != nullptr) GEM16GB_CHECK(total_arena->as_integer() == 9'552'348'416);
+      if (total_arena != nullptr) GEM16GB_CHECK(total_arena->as_integer() == 9'904'669'952);
       if (workspaces_planned != nullptr) GEM16GB_CHECK(!workspaces_planned->as_bool());
       if (fallbacks != nullptr) GEM16GB_CHECK(fallbacks->as_integer() == 0);
     }
   }
 
-  auto separate_options = shared_options;
-  separate_options.kv_storage = KvStorage::kSeparate;
-  auto separate = BuildMemoryPlan(config, manifest, separate_options);
-  GEM16GB_CHECK(separate.ok());
-  if (separate.ok()) {
-    GEM16GB_CHECK(separate.value().selected_kv_bytes == 704'643'072);
-    GEM16GB_CHECK(separate.value().total_arena_bytes - shared.value().total_arena_bytes == 352'321'536);
-  }
-
-  auto bf16_options = shared_options;
+  auto bf16_options = separate_options;
   bf16_options.kv_element_bytes = 2;
   auto bf16 = BuildMemoryPlan(config, manifest, bf16_options);
   GEM16GB_CHECK(bf16.ok());
   if (bf16.ok()) {
     GEM16GB_CHECK(bf16.value().shared_kv_bytes == 704'643'072);
+    GEM16GB_CHECK(bf16.value().selected_kv_bytes == 1'409'286'144);
   }
 
   GEM16GB_CHECK(!BuildMemoryPlan(config, manifest, MemoryPlanOptions{}).ok());
 
-  auto invalid_alignment = shared_options;
+  auto invalid_alignment = separate_options;
   invalid_alignment.arena_alignment = 192;
   GEM16GB_CHECK(!BuildMemoryPlan(config, manifest, invalid_alignment).ok());
 
@@ -141,13 +143,13 @@ void RunMemoryPlanTests() {
 
   auto short_config = config;
   short_config.max_positions = 32768;
-  GEM16GB_CHECK(!BuildMemoryPlan(short_config, manifest, shared_options).ok());
+  GEM16GB_CHECK(!BuildMemoryPlan(short_config, manifest, separate_options).ok());
 
   auto inconsistent_manifest = manifest;
   ++inconsistent_manifest.text_only_tensor_bytes;
-  GEM16GB_CHECK(!BuildMemoryPlan(config, inconsistent_manifest, shared_options).ok());
+  GEM16GB_CHECK(!BuildMemoryPlan(config, inconsistent_manifest, separate_options).ok());
 
-  auto overflow_options = shared_options;
+  auto overflow_options = separate_options;
   overflow_options.kv_element_bytes = std::numeric_limits<std::uint64_t>::max();
   GEM16GB_CHECK(!BuildMemoryPlan(config, manifest, overflow_options).ok());
 }

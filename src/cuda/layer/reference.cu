@@ -65,20 +65,21 @@ __global__ void RmsNormKernel(const float* input, const std::uint16_t* weight,
 }
 
 __global__ void RotaryKernel(float* states, std::uint64_t head_dimension,
-                             std::uint64_t rotary_dimensions, std::uint64_t position,
-                             double theta, std::uint64_t pairs) {
+                             std::uint64_t pair_stride, std::uint64_t rotating_pairs,
+                             std::uint64_t frequency_dimension, std::uint64_t position,
+                             double theta, double scaling_factor, std::uint64_t pairs) {
   const std::uint64_t pair = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (pair >= pairs) return;
-  const std::uint64_t half = rotary_dimensions / 2U;
-  const std::uint64_t head = pair / half;
-  const std::uint64_t index = pair % half;
+  const std::uint64_t head = pair / rotating_pairs;
+  const std::uint64_t index = pair % rotating_pairs;
   const double exponent = 2.0 * static_cast<double>(index) /
-                          static_cast<double>(rotary_dimensions);
-  const double angle = static_cast<double>(position) / pow(theta, exponent);
+                          static_cast<double>(frequency_dimension);
+  const double angle = static_cast<double>(position) /
+                       (pow(theta, exponent) * scaling_factor);
   const float cosine = static_cast<float>(cos(angle));
   const float sine = static_cast<float>(sin(angle));
   const std::uint64_t first = head * head_dimension + index;
-  const std::uint64_t second = first + half;
+  const std::uint64_t second = first + pair_stride;
   const float first_value = states[first];
   const float second_value = states[second];
   states[first] = first_value * cosine - second_value * sine;
@@ -184,9 +185,38 @@ Status LaunchRotaryEmbedding(float* states, std::uint64_t heads,
   const std::uint64_t blocks = Blocks(pairs);
   if (!ValidGrid(blocks)) return Invalid("RoPE grid exceeds CUDA limits");
   RotaryKernel<<<static_cast<unsigned>(blocks), kThreads, 0, stream>>>(
-      states, head_dimension, rotary_dimensions, position, theta, pairs);
+      states, head_dimension, rotary_dimensions / 2U, rotary_dimensions / 2U,
+      rotary_dimensions, position, theta, 1.0, pairs);
   const cudaError_t error = cudaGetLastError();
   return error == cudaSuccess ? Status::Ok() : CudaFailure("launch RoPE", error);
+}
+
+Status LaunchProportionalRotaryEmbedding(float* states, std::uint64_t heads,
+                                         std::uint64_t head_dimension, double rotary_factor,
+                                         std::uint64_t position, double theta,
+                                         double scaling_factor, cudaStream_t stream) {
+  if (states == nullptr) return Invalid("proportional RoPE requires a non-null state pointer");
+  if (heads == 0U || head_dimension == 0U || head_dimension % 2U != 0U ||
+      !std::isfinite(rotary_factor) || rotary_factor <= 0.0 || rotary_factor > 1.0 ||
+      !std::isfinite(theta) || theta <= 0.0 || !std::isfinite(scaling_factor) ||
+      scaling_factor <= 0.0) {
+    return Invalid("proportional RoPE geometry, factors, or theta are invalid");
+  }
+  const std::uint64_t half = head_dimension / 2U;
+  const std::uint64_t rotating_pairs =
+      static_cast<std::uint64_t>(rotary_factor * static_cast<double>(half));
+  if (rotating_pairs == 0U || rotating_pairs > half ||
+      heads > std::numeric_limits<std::uint64_t>::max() / rotating_pairs) {
+    return Invalid("proportional RoPE factor selects no valid pairs");
+  }
+  const std::uint64_t pairs = heads * rotating_pairs;
+  const std::uint64_t blocks = Blocks(pairs);
+  if (!ValidGrid(blocks)) return Invalid("proportional RoPE grid exceeds CUDA limits");
+  RotaryKernel<<<static_cast<unsigned>(blocks), kThreads, 0, stream>>>(
+      states, head_dimension, half, rotating_pairs, head_dimension, position, theta,
+      scaling_factor, pairs);
+  const cudaError_t error = cudaGetLastError();
+  return error == cudaSuccess ? Status::Ok() : CudaFailure("launch proportional RoPE", error);
 }
 
 Status LaunchAppendKv(const float* key, const float* value, float* key_cache,

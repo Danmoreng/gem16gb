@@ -120,14 +120,17 @@ Result<MemoryPlan> BuildMemoryPlan(const ModelConfig& config, const ModelManifes
       config.global_head_dimension == 0) {
     return Status(StatusCode::kInvalidArgument, "model config is incomplete for memory planning");
   }
-  if (options.kv_storage == KvStorage::kShared && !config.attention_k_eq_v) {
-    return Status(StatusCode::kUnsupported, "shared K/V storage requires attention_k_eq_v=true");
+  if (options.kv_storage == KvStorage::kShared) {
+    return Status(
+        StatusCode::kUnsupported,
+        "shared physical K/V storage is unsupported: attention_k_eq_v reuses only the "
+        "projection output; K normalization/RoPE and V normalization produce distinct cache states");
   }
 
   MemoryPlan plan;
   plan.model_directory = manifest.model_directory;
   plan.context_profile = ProfileName(options.context_profile);
-  plan.kv_storage = options.kv_storage == KvStorage::kShared ? "shared" : "separate";
+  plan.kv_storage = "separate";
   plan.context_tokens = context_tokens.value();
   plan.kv_element_bytes = options.kv_element_bytes;
   plan.arena_alignment = options.arena_alignment;
@@ -177,8 +180,7 @@ Result<MemoryPlan> BuildMemoryPlan(const ModelConfig& config, const ModelManifes
   auto separate_bytes = CheckedMultiply({plan.shared_kv_bytes, 2}, "separate KV cache");
   if (!separate_bytes.ok()) return separate_bytes.status();
   plan.separate_kv_bytes = separate_bytes.value();
-  plan.selected_kv_bytes =
-      options.kv_storage == KvStorage::kShared ? plan.shared_kv_bytes : plan.separate_kv_bytes;
+  plan.selected_kv_bytes = plan.separate_kv_bytes;
 
   std::uint64_t cursor = 0;
   auto status = AddRegion(plan, cursor, "immutable_model_weights", plan.model_weight_bytes,

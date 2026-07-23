@@ -482,6 +482,32 @@ void TestLocalLayerReferenceOperators() {
   for (std::size_t index = 0; index < gpu_rope.size(); ++index) {
     CUDA_TEST_CHECK(std::fabs(gpu_rope[index] - host_rope[index]) < 2.0e-6F);
   }
+
+  std::vector<float> host_proportional_rope(512);
+  for (std::size_t index = 0; index < host_proportional_rope.size(); ++index) {
+    host_proportional_rope[index] = static_cast<float>(index + 1U) * 0.002F;
+  }
+  DeviceBuffer<float> device_proportional_rope(host_proportional_rope.size());
+  if (device_proportional_rope.get() == nullptr ||
+      !CudaOk(cudaMemcpy(device_proportional_rope.get(), host_proportional_rope.data(),
+                         device_proportional_rope.bytes(), cudaMemcpyHostToDevice),
+              "copy proportional RoPE input")) return;
+  CUDA_TEST_CHECK(gem16gb::layer::ApplyProportionalRotaryEmbedding(
+                      host_proportional_rope, 1, 512, 0.25, 31, 1'000'000.0)
+                      .ok());
+  const auto proportional_status = gem16gb::internal::LaunchProportionalRotaryEmbedding(
+      device_proportional_rope.get(), 1, 512, 0.25, 31, 1'000'000.0, 1.0, nullptr);
+  CUDA_TEST_CHECK(proportional_status.ok());
+  if (!proportional_status.ok() ||
+      !CudaOk(cudaDeviceSynchronize(), "proportional RoPE synchronize")) return;
+  std::vector<float> gpu_proportional_rope(host_proportional_rope.size());
+  if (!CudaOk(cudaMemcpy(gpu_proportional_rope.data(), device_proportional_rope.get(),
+                         device_proportional_rope.bytes(), cudaMemcpyDeviceToHost),
+              "copy proportional RoPE output")) return;
+  for (std::size_t index = 0; index < gpu_proportional_rope.size(); ++index) {
+    CUDA_TEST_CHECK(std::fabs(gpu_proportional_rope[index] -
+                              host_proportional_rope[index]) < 2.0e-6F);
+  }
 }
 
 }  // namespace

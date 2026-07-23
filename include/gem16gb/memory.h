@@ -39,6 +39,8 @@ struct MemoryPlan {
   std::uint64_t text_only_source_bytes = 0;
   std::uint64_t model_weight_bytes = 0;
   std::uint64_t scale_bytes = 0;
+  // One final attention state per token. Retained as a diagnostic lower bound;
+  // Gemma 4 requires separate final K and V cache storage.
   std::uint64_t local_shared_kv_bytes = 0;
   std::uint64_t global_shared_kv_bytes = 0;
   std::uint64_t shared_kv_bytes = 0;
@@ -46,6 +48,7 @@ struct MemoryPlan {
   std::uint64_t selected_kv_bytes = 0;
   std::uint64_t padding_bytes = 0;
   std::uint64_t total_arena_bytes = 0;
+  bool shared_kv_storage_supported = false;
   bool execution_workspaces_planned = false;
   std::vector<MemoryRegion> regions;
 };

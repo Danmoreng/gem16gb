@@ -47,6 +47,8 @@ Status WriteMemoryPlanJson(const MemoryPlan& plan, std::ostream& output) {
          << "  \"shared_kv_bytes\": " << plan.shared_kv_bytes << ",\n"
          << "  \"separate_kv_bytes\": " << plan.separate_kv_bytes << ",\n"
          << "  \"selected_kv_bytes\": " << plan.selected_kv_bytes << ",\n"
+         << "  \"shared_kv_storage_supported\": "
+         << (plan.shared_kv_storage_supported ? "true" : "false") << ",\n"
          << "  \"padding_bytes\": " << plan.padding_bytes << ",\n"
          << "  \"total_arena_bytes\": " << plan.total_arena_bytes << ",\n"
          << "  \"execution_workspaces_planned\": "
@@ -76,7 +78,7 @@ void PrintMemoryPlanSummary(const MemoryPlan& plan, std::ostream& output) {
          << static_cast<double>(plan.model_weight_bytes) / kMiB << " MiB\n"
          << "  scales: " << static_cast<double>(plan.scale_bytes) / kMiB << " MiB\n"
          << "  KV selected: " << static_cast<double>(plan.selected_kv_bytes) / kMiB << " MiB"
-         << " (shared=" << static_cast<double>(plan.shared_kv_bytes) / kMiB
+         << " (one-state lower bound=" << static_cast<double>(plan.shared_kv_bytes) / kMiB
          << ", separate=" << static_cast<double>(plan.separate_kv_bytes) / kMiB << ")\n"
          << "  known arena total: " << static_cast<double>(plan.total_arena_bytes) / kMiB << " MiB\n"
          << "  execution workspaces: not planned yet\n";

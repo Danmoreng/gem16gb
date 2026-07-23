@@ -22,11 +22,11 @@ void Usage(std::ostream& output) {
          << "Memory mode:\n"
          << "  gem16gb-bench memory --model <checkpoint-dir>\n"
          << "      --profile <interactive|standard|long|xlong|max>\n"
-         << "      --kv-storage <shared|separate> [--kv-element-bytes <1|2>]\n"
+         << "      --kv-storage separate [--kv-element-bytes <1|2>]\n"
          << "\n"
          << "Kernel mode (CUDA):\n"
          << "  gem16gb-bench kernel --model <checkpoint-dir>\n"
-         << "      [--projection <gate|up|down|mlp|q|k|v|o|local-attention>]\n"
+         << "      [--projection <gate|up|down|mlp|q|k|v|o|local-attention|global-attention>]\n"
          << "      [--warmups <count>] [--iterations <count>]\n";
 }
 
@@ -120,7 +120,8 @@ int RunKernelMode(int argc, char** argv) {
       projection = argv[++index];
       if (projection != "gate" && projection != "up" && projection != "down" &&
           projection != "mlp" && projection != "q" && projection != "k" &&
-          projection != "v" && projection != "o" && projection != "local-attention") {
+          projection != "v" && projection != "o" && projection != "local-attention" &&
+          projection != "global-attention") {
         std::cerr << "error: unsupported kernel projection\n";
         return 64;
       }
@@ -146,6 +147,40 @@ int RunKernelMode(int argc, char** argv) {
   }
 
 #if GEM16GB_HAS_CUDA
+  if (projection == "global-attention") {
+    auto result = gem16gb::internal::RunLayer5GlobalAttentionCheckpointProbe(model_directory);
+    if (!result.ok()) {
+      std::cerr << "error: " << result.status().message() << '\n';
+      return 1;
+    }
+    const auto& probe = result.value();
+    std::cerr << "Layer-5 global-attention checkpoint probe\n"
+              << "  path: RMSNorm -> Q/K -> K reuse for V -> Q/K/V norm -> proportional RoPE -> "
+                 "KV append/read -> softmax -> O -> RMSNorm -> residual\n"
+              << "  context: " << probe.context_tokens << " tokens\n"
+              << "  reference/native max abs: " << probe.reference_native_max_abs << '\n'
+              << "  reference/native cosine: " << probe.reference_native_cosine << '\n';
+    std::cout << std::setprecision(17)
+              << "{\"schema_version\":1,\"status\":\"characterization\","
+              << "\"benchmark_qualified\":false,\"mode\":\"kernel\",\"fallbacks\":0,"
+              << "\"operator\":\"layer5_global_attention\",\"precision\":\"fp8_attention\","
+              << "\"context_tokens\":" << probe.context_tokens
+              << ",\"k_projection_reused_for_v\":"
+              << (probe.reused_k_projection_for_v ? "true" : "false")
+              << ",\"source_layout_direct\":true,\"persistent_repack_bytes\":0,\"device_bytes\":"
+              << probe.device_bytes << ",\"error\":{\"reference_native_max_abs\":"
+              << probe.reference_native_max_abs << ",\"reference_native_rms\":"
+              << probe.reference_native_rms << ",\"reference_native_cosine\":"
+              << probe.reference_native_cosine << "},\"samples\":[";
+    for (std::size_t index = 0; index < probe.samples.size(); ++index) {
+      if (index != 0) std::cout << ',';
+      const auto& sample = probe.samples[index];
+      std::cout << "{\"element\":" << sample.element << ",\"cuda_reference\":"
+                << sample.cuda_reference << ",\"sm120_direct\":" << sample.sm120_direct << '}';
+    }
+    std::cout << "]}\n";
+    return 0;
+  }
   if (projection == "local-attention") {
     auto result = gem16gb::internal::RunLayer0LocalAttentionCheckpointProbe(model_directory);
     if (!result.ok()) {

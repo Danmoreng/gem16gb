@@ -25,14 +25,30 @@ namespace {
 
 constexpr std::uint64_t kHidden = 3840;
 constexpr std::uint64_t kQueryHeads = 16;
-constexpr std::uint64_t kKvHeads = 8;
-constexpr std::uint64_t kHeadDimension = 256;
-constexpr std::uint64_t kQueryElements = kQueryHeads * kHeadDimension;
-constexpr std::uint64_t kKvElements = kKvHeads * kHeadDimension;
 constexpr std::uint64_t kContextTokens = 32;
 constexpr float kEpsilon = 1.0e-6F;
-constexpr double kTheta = 10000.0;
-constexpr char kBase[] = "model.language_model.layers.0.";
+
+struct AttentionGeometry {
+  std::uint64_t layer = 0;
+  std::uint64_t kv_heads = 0;
+  std::uint64_t head_dimension = 0;
+  double theta = 0.0;
+  bool proportional_rope = false;
+  bool reuse_k_projection_for_v = false;
+
+  [[nodiscard]] std::uint64_t query_elements() const {
+    return kQueryHeads * head_dimension;
+  }
+  [[nodiscard]] std::uint64_t kv_elements() const {
+    return kv_heads * head_dimension;
+  }
+  [[nodiscard]] std::string base() const {
+    return "model.language_model.layers." + std::to_string(layer) + ".";
+  }
+};
+
+constexpr AttentionGeometry kLocalGeometry{0, 8, 256, 10000.0, false, false};
+constexpr AttentionGeometry kGlobalGeometry{5, 1, 512, 1000000.0, true, true};
 
 Status Error(StatusCode code, std::string message) {
   return Status(code, std::move(message));
@@ -68,9 +84,9 @@ struct HostFp8Binding {
 };
 
 Result<HostFp8Binding> BindFp8(const ModelManifest& manifest, const MappedFile& mapped,
-                              const std::string& projection, std::uint64_t rows,
-                              std::uint64_t contracting) {
-  const std::string name = std::string(kBase) + "self_attn." + projection + "_proj.weight";
+                              const std::string& base, const std::string& projection,
+                              std::uint64_t rows, std::uint64_t contracting) {
+  const std::string name = base + "self_attn." + projection + "_proj.weight";
   const TensorInfo* weight = FindTensor(manifest, name);
   const TensorInfo* scales = FindTensor(manifest, name + "_scale");
   if (weight == nullptr || scales == nullptr) {
@@ -157,12 +173,12 @@ std::vector<float> DeterministicHidden() {
   return values;
 }
 
-std::vector<float> DeterministicCache(bool value_cache) {
-  std::vector<float> values(kContextTokens * kKvElements);
+std::vector<float> DeterministicCache(const AttentionGeometry& geometry, bool value_cache) {
+  std::vector<float> values(kContextTokens * geometry.kv_elements());
   for (std::uint64_t token = 0; token + 1U < kContextTokens; ++token) {
-    for (std::uint64_t element = 0; element < kKvElements; ++element) {
+    for (std::uint64_t element = 0; element < geometry.kv_elements(); ++element) {
       const double phase = static_cast<double>(token * 37U + element);
-      values[static_cast<std::size_t>(token * kKvElements + element)] =
+      values[static_cast<std::size_t>(token * geometry.kv_elements() + element)] =
           static_cast<float>((value_cache ? 0.07 : 0.05) * std::sin(phase * 0.019) +
                              (value_cache ? 0.03 : 0.04) * std::cos(phase * 0.013));
     }
@@ -203,19 +219,19 @@ struct PathBuffers {
   DeviceBuffer<float> final;
 };
 
-Status AllocatePath(PathBuffers& path) {
+Status AllocatePath(const AttentionGeometry& geometry, PathBuffers& path) {
   for (const Status status : {
-      path.q.Allocate(kQueryElements, "allocate Q"),
-      path.k.Allocate(kKvElements, "allocate K"),
-      path.v.Allocate(kKvElements, "allocate V"),
-      path.q_norm.Allocate(kQueryElements, "allocate normalized Q"),
-      path.k_norm.Allocate(kKvElements, "allocate normalized K"),
-      path.v_norm.Allocate(kKvElements, "allocate normalized V"),
-      path.key_cache.Allocate(kContextTokens * kKvElements, "allocate K cache"),
-      path.value_cache.Allocate(kContextTokens * kKvElements, "allocate V cache"),
+      path.q.Allocate(geometry.query_elements(), "allocate Q"),
+      path.k.Allocate(geometry.kv_elements(), "allocate K"),
+      path.v.Allocate(geometry.kv_elements(), "allocate V"),
+      path.q_norm.Allocate(geometry.query_elements(), "allocate normalized Q"),
+      path.k_norm.Allocate(geometry.kv_elements(), "allocate normalized K"),
+      path.v_norm.Allocate(geometry.kv_elements(), "allocate normalized V"),
+      path.key_cache.Allocate(kContextTokens * geometry.kv_elements(), "allocate K cache"),
+      path.value_cache.Allocate(kContextTokens * geometry.kv_elements(), "allocate V cache"),
       path.scores.Allocate(kQueryHeads * kContextTokens, "allocate attention scores"),
-      path.attention.Allocate(kQueryElements, "allocate attention output"),
-      path.o_activation.Allocate(kQueryElements, "allocate O activation"),
+      path.attention.Allocate(geometry.query_elements(), "allocate attention output"),
+      path.o_activation.Allocate(geometry.query_elements(), "allocate O activation"),
       path.o_scale.Allocate(1, "allocate O activation scale"),
       path.o_output.Allocate(kHidden, "allocate O projection output"),
       path.post_norm.Allocate(kHidden, "allocate post-attention norm"),
@@ -233,9 +249,9 @@ std::uint64_t PathBytes(const PathBuffers& path) {
       path.post_norm.bytes() + path.final.bytes());
 }
 
-Status RunPath(ProjectionPath projection_path, PathBuffers& path,
+Status RunPath(const AttentionGeometry& geometry, ProjectionPath projection_path, PathBuffers& path,
                const DeviceFp8Binding& q_binding, const DeviceFp8Binding& k_binding,
-               const DeviceFp8Binding& v_binding, const DeviceFp8Binding& o_binding,
+               const DeviceFp8Binding* v_binding, const DeviceFp8Binding& o_binding,
                const std::uint8_t* input_activation, const float* input_scale,
                const float* residual, const std::uint16_t* q_norm_weight,
                const std::uint16_t* k_norm_weight, const std::uint16_t* post_norm_weight,
@@ -246,88 +262,142 @@ Status RunPath(ProjectionPath projection_path, PathBuffers& path,
   error = cudaMemcpy(path.value_cache.get(), host_values.data(), path.value_cache.bytes(),
                      cudaMemcpyHostToDevice);
   if (error != cudaSuccess) return CudaFailure("initialize V cache", error);
-  for (const Status status : {
-      LaunchProjection(projection_path, input_activation, input_scale, q_binding, path.q.get()),
-      LaunchProjection(projection_path, input_activation, input_scale, k_binding, path.k.get()),
-      LaunchProjection(projection_path, input_activation, input_scale, v_binding, path.v.get()),
+  Status status = LaunchProjection(projection_path, input_activation, input_scale, q_binding,
+                                   path.q.get());
+  if (!status.ok()) return status;
+  status = LaunchProjection(projection_path, input_activation, input_scale, k_binding,
+                            path.k.get());
+  if (!status.ok()) return status;
+  if (geometry.reuse_k_projection_for_v) {
+    error = cudaMemcpyAsync(path.v.get(), path.k.get(), path.v.bytes(),
+                            cudaMemcpyDeviceToDevice, nullptr);
+    if (error != cudaSuccess) return CudaFailure("reuse K projection for V", error);
+  } else {
+    if (v_binding == nullptr) {
+      return Error(StatusCode::kInternal, "local attention V binding is absent");
+    }
+    status = LaunchProjection(projection_path, input_activation, input_scale, *v_binding,
+                              path.v.get());
+    if (!status.ok()) return status;
+  }
+  for (const Status next : {
       LaunchRmsNorm(path.q.get(), q_norm_weight, path.q_norm.get(), kQueryHeads,
-                    kHeadDimension, kEpsilon, nullptr),
-      LaunchRmsNorm(path.k.get(), k_norm_weight, path.k_norm.get(), kKvHeads,
-                    kHeadDimension, kEpsilon, nullptr),
-      LaunchRmsNorm(path.v.get(), nullptr, path.v_norm.get(), kKvHeads,
-                    kHeadDimension, kEpsilon, nullptr),
-      LaunchRotaryEmbedding(path.q_norm.get(), kQueryHeads, kHeadDimension, kHeadDimension,
-                            kContextTokens - 1U, kTheta, nullptr),
-      LaunchRotaryEmbedding(path.k_norm.get(), kKvHeads, kHeadDimension, kHeadDimension,
-                            kContextTokens - 1U, kTheta, nullptr),
+                    geometry.head_dimension, kEpsilon, nullptr),
+      LaunchRmsNorm(path.k.get(), k_norm_weight, path.k_norm.get(), geometry.kv_heads,
+                    geometry.head_dimension, kEpsilon, nullptr),
+      LaunchRmsNorm(path.v.get(), nullptr, path.v_norm.get(), geometry.kv_heads,
+                    geometry.head_dimension, kEpsilon, nullptr),
+  }) if (!next.ok()) return next;
+  if (geometry.proportional_rope) {
+    status = LaunchProportionalRotaryEmbedding(
+        path.q_norm.get(), kQueryHeads, geometry.head_dimension, 0.25,
+        kContextTokens - 1U, geometry.theta, 1.0, nullptr);
+    if (!status.ok()) return status;
+    status = LaunchProportionalRotaryEmbedding(
+        path.k_norm.get(), geometry.kv_heads, geometry.head_dimension, 0.25,
+        kContextTokens - 1U, geometry.theta, 1.0, nullptr);
+  } else {
+    status = LaunchRotaryEmbedding(path.q_norm.get(), kQueryHeads, geometry.head_dimension,
+                                   geometry.head_dimension, kContextTokens - 1U,
+                                   geometry.theta, nullptr);
+    if (!status.ok()) return status;
+    status = LaunchRotaryEmbedding(path.k_norm.get(), geometry.kv_heads,
+                                   geometry.head_dimension, geometry.head_dimension,
+                                   kContextTokens - 1U, geometry.theta, nullptr);
+  }
+  if (!status.ok()) return status;
+  for (const Status next : {
       LaunchAppendKv(path.k_norm.get(), path.v_norm.get(), path.key_cache.get(),
-                     path.value_cache.get(), kContextTokens - 1U, kKvHeads,
-                     kHeadDimension, nullptr),
+                     path.value_cache.get(), kContextTokens - 1U, geometry.kv_heads,
+                     geometry.head_dimension, nullptr),
       LaunchLocalAttentionDecode(path.q_norm.get(), path.key_cache.get(), path.value_cache.get(),
-                                 path.scores.get(), path.attention.get(), kQueryHeads, kKvHeads,
-                                 kHeadDimension, kContextTokens, nullptr),
+                                 path.scores.get(), path.attention.get(), kQueryHeads,
+                                 geometry.kv_heads, geometry.head_dimension, kContextTokens, nullptr),
       LaunchFp8ReferenceTokenQuantization(path.attention.get(), path.o_activation.get(),
-                                          path.o_scale.get(), kQueryElements, nullptr),
+                                          path.o_scale.get(), geometry.query_elements(), nullptr),
       LaunchProjection(projection_path, path.o_activation.get(), path.o_scale.get(), o_binding,
                        path.o_output.get()),
       LaunchRmsNorm(path.o_output.get(), post_norm_weight, path.post_norm.get(), 1, kHidden,
                     kEpsilon, nullptr),
       LaunchAddResidual(path.post_norm.get(), residual, path.final.get(), kHidden, nullptr),
-  }) if (!status.ok()) return status;
+  }) if (!next.ok()) return next;
   return Status::Ok();
 }
 
 }  // namespace
 
-Result<LocalAttentionCheckpointProbeResult> RunLayer0LocalAttentionCheckpointProbe(
-    const std::filesystem::path& model_directory) {
+namespace {
+
+Result<AttentionCheckpointProbeResult> RunAttentionCheckpointProbe(
+    const std::filesystem::path& model_directory, const AttentionGeometry& geometry) {
   auto manifest = InspectCheckpoint({model_directory, true});
   if (!manifest.ok()) return manifest.status();
   auto mapped = MappedFile::Open(model_directory / "model.safetensors");
   if (!mapped.ok()) return mapped.status();
-  auto q = BindFp8(manifest.value(), mapped.value(), "q", kQueryElements, kHidden);
-  auto k = BindFp8(manifest.value(), mapped.value(), "k", kKvElements, kHidden);
-  auto v = BindFp8(manifest.value(), mapped.value(), "v", kKvElements, kHidden);
-  auto o = BindFp8(manifest.value(), mapped.value(), "o", kHidden, kQueryElements);
-  auto input_norm = BindBf16(manifest.value(), mapped.value(), std::string(kBase) +
+  const std::string base = geometry.base();
+  auto q = BindFp8(manifest.value(), mapped.value(), base, "q", geometry.query_elements(), kHidden);
+  auto k = BindFp8(manifest.value(), mapped.value(), base, "k", geometry.kv_elements(), kHidden);
+  auto o = BindFp8(manifest.value(), mapped.value(), base, "o", kHidden, geometry.query_elements());
+  HostFp8Binding v;
+  if (!geometry.reuse_k_projection_for_v) {
+    auto bound_v =
+        BindFp8(manifest.value(), mapped.value(), base, "v", geometry.kv_elements(), kHidden);
+    if (!bound_v.ok()) return bound_v.status();
+    v = bound_v.value();
+  } else if (FindTensor(manifest.value(), base + "self_attn.v_proj.weight") != nullptr) {
+    return Error(StatusCode::kDataLoss,
+                 "global attention unexpectedly contains a separate V projection");
+  }
+  auto input_norm = BindBf16(manifest.value(), mapped.value(), base +
                              "input_layernorm.weight", kHidden);
-  auto q_norm = BindBf16(manifest.value(), mapped.value(), std::string(kBase) +
-                         "self_attn.q_norm.weight", kHeadDimension);
-  auto k_norm = BindBf16(manifest.value(), mapped.value(), std::string(kBase) +
-                         "self_attn.k_norm.weight", kHeadDimension);
-  auto post_norm = BindBf16(manifest.value(), mapped.value(), std::string(kBase) +
+  auto q_norm = BindBf16(manifest.value(), mapped.value(), base +
+                         "self_attn.q_norm.weight", geometry.head_dimension);
+  auto k_norm = BindBf16(manifest.value(), mapped.value(), base +
+                         "self_attn.k_norm.weight", geometry.head_dimension);
+  auto post_norm = BindBf16(manifest.value(), mapped.value(), base +
                             "post_attention_layernorm.weight", kHidden);
-  if (!q.ok()) return q.status(); if (!k.ok()) return k.status();
-  if (!v.ok()) return v.status(); if (!o.ok()) return o.status();
-  if (!input_norm.ok()) return input_norm.status(); if (!q_norm.ok()) return q_norm.status();
-  if (!k_norm.ok()) return k_norm.status(); if (!post_norm.ok()) return post_norm.status();
+  if (!q.ok()) return q.status();
+  if (!k.ok()) return k.status();
+  if (!o.ok()) return o.status();
+  if (!input_norm.ok()) return input_norm.status();
+  if (!q_norm.ok()) return q_norm.status();
+  if (!k_norm.ok()) return k_norm.status();
+  if (!post_norm.ok()) return post_norm.status();
 
   cudaDeviceProp properties{};
   cudaError_t error = cudaGetDeviceProperties(&properties, 0);
   if (error != cudaSuccess) return CudaFailure("cudaGetDeviceProperties", error);
   if (properties.major != 12 || properties.minor != 0) {
-    return Error(StatusCode::kUnsupported, "local attention checkpoint probe requires SM120");
+    return Error(StatusCode::kUnsupported, "attention checkpoint probe requires SM120");
   }
 
   DeviceFp8Binding device_q, device_k, device_v, device_o;
   for (const Status status : {UploadBinding(q.value(), device_q), UploadBinding(k.value(), device_k),
-                              UploadBinding(v.value(), device_v), UploadBinding(o.value(), device_o)})
+                              UploadBinding(o.value(), device_o)})
     if (!status.ok()) return status;
+  const DeviceFp8Binding* device_v_pointer = nullptr;
+  if (!geometry.reuse_k_projection_for_v) {
+    const Status upload_v = UploadBinding(v, device_v);
+    if (!upload_v.ok()) return upload_v;
+    device_v_pointer = &device_v;
+  }
   DeviceBuffer<float> hidden, normalized;
   DeviceBuffer<std::uint8_t> activation;
   DeviceBuffer<float> activation_scale;
   DeviceBuffer<std::uint16_t> input_norm_weight, q_norm_weight, k_norm_weight, post_norm_weight;
   for (const Status status : {
-      hidden.Allocate(kHidden, "allocate hidden"), normalized.Allocate(kHidden, "allocate normalized hidden"),
-      activation.Allocate(kHidden, "allocate FP8 hidden"), activation_scale.Allocate(1, "allocate hidden scale"),
+      hidden.Allocate(kHidden, "allocate hidden"),
+      normalized.Allocate(kHidden, "allocate normalized hidden"),
+      activation.Allocate(kHidden, "allocate FP8 hidden"),
+      activation_scale.Allocate(1, "allocate hidden scale"),
       input_norm_weight.Allocate(kHidden, "allocate input norm weight"),
-      q_norm_weight.Allocate(kHeadDimension, "allocate Q norm weight"),
-      k_norm_weight.Allocate(kHeadDimension, "allocate K norm weight"),
+      q_norm_weight.Allocate(geometry.head_dimension, "allocate Q norm weight"),
+      k_norm_weight.Allocate(geometry.head_dimension, "allocate K norm weight"),
       post_norm_weight.Allocate(kHidden, "allocate post norm weight")})
     if (!status.ok()) return status;
   const auto host_hidden = DeterministicHidden();
-  const auto host_keys = DeterministicCache(false);
-  const auto host_values = DeterministicCache(true);
+  const auto host_keys = DeterministicCache(geometry, false);
+  const auto host_values = DeterministicCache(geometry, true);
   const std::array<std::pair<void*, std::span<const std::uint8_t>>, 4> norm_copies = {{
       {input_norm_weight.get(), input_norm.value()},
       {q_norm_weight.get(), q_norm.value()},
@@ -348,32 +418,42 @@ Result<LocalAttentionCheckpointProbeResult> RunLayer0LocalAttentionCheckpointPro
   if (!status.ok()) return status;
 
   PathBuffers reference, native;
-  status = AllocatePath(reference); if (!status.ok()) return status;
-  status = AllocatePath(native); if (!status.ok()) return status;
-  status = RunPath(ProjectionPath::kReference, reference, device_q, device_k, device_v, device_o,
+  status = AllocatePath(geometry, reference);
+  if (!status.ok()) return status;
+  status = AllocatePath(geometry, native);
+  if (!status.ok()) return status;
+  status = RunPath(geometry, ProjectionPath::kReference, reference, device_q, device_k,
+                   device_v_pointer, device_o,
                    activation.get(), activation_scale.get(), hidden.get(), q_norm_weight.get(),
                    k_norm_weight.get(), post_norm_weight.get(), host_keys, host_values);
   if (!status.ok()) return status;
-  status = RunPath(ProjectionPath::kSm120, native, device_q, device_k, device_v, device_o,
+  status = RunPath(geometry, ProjectionPath::kSm120, native, device_q, device_k,
+                   device_v_pointer, device_o,
                    activation.get(), activation_scale.get(), hidden.get(), q_norm_weight.get(),
                    k_norm_weight.get(), post_norm_weight.get(), host_keys, host_values);
   if (!status.ok()) return status;
   error = cudaDeviceSynchronize();
-  if (error != cudaSuccess) return CudaFailure("local attention probe synchronize", error);
+  if (error != cudaSuccess) return CudaFailure("attention probe synchronize", error);
   std::vector<float> host_reference(kHidden), host_native(kHidden);
-  error = cudaMemcpy(host_reference.data(), reference.final.get(), reference.final.bytes(), cudaMemcpyDeviceToHost);
+  error = cudaMemcpy(host_reference.data(), reference.final.get(), reference.final.bytes(),
+                     cudaMemcpyDeviceToHost);
   if (error != cudaSuccess) return CudaFailure("copy reference attention output", error);
-  error = cudaMemcpy(host_native.data(), native.final.get(), native.final.bytes(), cudaMemcpyDeviceToHost);
+  error = cudaMemcpy(host_native.data(), native.final.get(), native.final.bytes(),
+                     cudaMemcpyDeviceToHost);
   if (error != cudaSuccess) return CudaFailure("copy native attention output", error);
 
-  LocalAttentionCheckpointProbeResult result;
+  AttentionCheckpointProbeResult result;
+  result.layer = geometry.layer;
   result.context_tokens = kContextTokens;
+  result.global_attention = geometry.proportional_rope;
+  result.reused_k_projection_for_v = geometry.reuse_k_projection_for_v;
   double squared_error = 0.0, dot = 0.0, reference_norm = 0.0, native_norm = 0.0;
   for (std::size_t index = 0; index < host_reference.size(); ++index) {
     if (!std::isfinite(host_reference[index]) || !std::isfinite(host_native[index]))
-      return Error(StatusCode::kDataLoss, "local attention probe produced non-finite output");
+      return Error(StatusCode::kDataLoss, "attention probe produced non-finite output");
     const double difference = static_cast<double>(host_reference[index]) - host_native[index];
-    result.reference_native_max_abs = std::max(result.reference_native_max_abs, std::fabs(difference));
+    result.reference_native_max_abs =
+        std::max(result.reference_native_max_abs, std::fabs(difference));
     squared_error += difference * difference;
     dot += static_cast<double>(host_reference[index]) * host_native[index];
     reference_norm += static_cast<double>(host_reference[index]) * host_reference[index];
@@ -381,8 +461,10 @@ Result<LocalAttentionCheckpointProbeResult> RunLayer0LocalAttentionCheckpointPro
   }
   result.reference_native_rms = std::sqrt(squared_error / static_cast<double>(kHidden));
   result.reference_native_cosine = dot / std::sqrt(reference_norm * native_norm);
-  for (const std::uint64_t element : std::array<std::uint64_t, 8>{0, 1, 127, 511, 1023, 2047, 3071, 3839})
+  for (const std::uint64_t element :
+       std::array<std::uint64_t, 8>{0, 1, 127, 511, 1023, 2047, 3071, 3839}) {
     result.samples.push_back({element, host_reference[element], host_native[element]});
+  }
   result.device_bytes = static_cast<std::uint64_t>(
       device_q.weight.bytes() + device_q.scales.bytes() + device_k.weight.bytes() +
       device_k.scales.bytes() + device_v.weight.bytes() + device_v.scales.bytes() +
@@ -391,6 +473,18 @@ Result<LocalAttentionCheckpointProbeResult> RunLayer0LocalAttentionCheckpointPro
       q_norm_weight.bytes() + k_norm_weight.bytes() + post_norm_weight.bytes()) +
       PathBytes(reference) + PathBytes(native);
   return result;
+}
+
+}  // namespace
+
+Result<AttentionCheckpointProbeResult> RunLayer0LocalAttentionCheckpointProbe(
+    const std::filesystem::path& model_directory) {
+  return RunAttentionCheckpointProbe(model_directory, kLocalGeometry);
+}
+
+Result<AttentionCheckpointProbeResult> RunLayer5GlobalAttentionCheckpointProbe(
+    const std::filesystem::path& model_directory) {
+  return RunAttentionCheckpointProbe(model_directory, kGlobalGeometry);
 }
 
 }  // namespace gem16gb::internal

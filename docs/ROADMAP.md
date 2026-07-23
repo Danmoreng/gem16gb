@@ -55,12 +55,14 @@ The llama.cpp benchmark is deliberately before engine kernel optimization, but a
 8. Add a separate native prefill plan, initially qualified against pinned CUTLASS/cuBLASLt block-scaled GEMM. Do
    not reuse the decode plan merely for implementation convenience.
 9. The checkpoint's FP8 Q/K/V/O projection path is implemented with an independent CPU oracle, CUDA reference,
-   direct-source `QMMA.16832` route, and real Layer-0 checks. The first unfused local-attention decode sublayer now
-   assembles input RMSNorm, Q/K/V, per-head Q/K and scale-free V normalization, RoPE, KV append/read, FP32 softmax,
-   O projection, post-attention RMSNorm, and residual over a deterministic 32-token cache. Next add the distinct
-   full-attention K=V route, then connect the validated attention and MLP sublayers into a trusted-hidden-state
-   Layer-0 golden. Follow ninfer's useful split-output planning pattern for combined Q/K/V while retaining this
-   checkpoint's E4M3/BF16 scale contract.
+   direct-source `QMMA.16832` route, and real Layer-0 checks. The unfused local-attention decode sublayer assembles
+   input RMSNorm, Q/K/V, per-head Q/K and scale-free V normalization, RoPE, separate K/V append/read, FP32 softmax,
+   O projection, post-attention RMSNorm, and residual over a deterministic 32-token cache. The distinct real
+   Layer-5 full-attention route now reuses the raw K projection for V, applies learned K norm plus proportional RoPE
+   separately from scale-free V norm, and proves that the final cache states cannot share storage. Next connect the
+   validated attention and MLP sublayers into a trusted-hidden-state Layer-0 golden. Follow ninfer's useful
+   split-output planning pattern for combined projections while retaining this checkpoint's E4M3/BF16 scale
+   contract.
 10. Complete execution-workspace planning and add specialized attention, KV cache, decode fusion, and CUDA Graph
    replay only after the unfused model passes layer, logit, and generation gates.
 11. Validate 64K, then 128K context. MTP and multimodal work remain later milestones.
