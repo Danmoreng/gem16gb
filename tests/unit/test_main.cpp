@@ -3,6 +3,7 @@
 #include "test.h"
 
 void RunJsonTests();
+void RunFp8Tests();
 void RunMemoryPlanTests();
 void RunNvfp4Tests();
 void RunSafetensorsTests();
@@ -10,6 +11,7 @@ void RunSm120LayoutTests();
 
 int main() {
   RunJsonTests();
+  RunFp8Tests();
   RunMemoryPlanTests();
   RunNvfp4Tests();
   RunSafetensorsTests();

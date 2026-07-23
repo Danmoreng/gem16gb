@@ -38,6 +38,14 @@ Disassembly of the CUDA test binary contains `OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.
 real-shape evidence, but the kernel remains experimental until layer-golden, numerical-distribution, memory-arena,
 and end-to-end gates pass.
 
+Level 1 FP8 bring-up now includes host E4M3FN/BF16 decoding, dynamic per-token activation quantization, a binary64
+per-channel-scale projection oracle, an independent CUDA scalar reference, and a direct-source SM120 tensor-core
+route. The real Layer-0 Q `[4096,3840]`, K/V `[2048,3840]`, and O `[3840,4096]` shapes all produce bit-identical
+CPU/CUDA activation bytes and scale bits. Across those fixtures the largest CUDA-reference/native absolute
+difference is `8.9406967e-7`; the largest selected-row binary64/native difference is below `1.0e-7`.
+Disassembly additionally contains `QMMA.16832.F32.E4M3.E4M3`. As with NVFP4, this proves the intended arithmetic
+instruction and real storage mapping, not yet a complete attention layer.
+
 Reproduce the instruction check with:
 
 ```bash

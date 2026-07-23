@@ -1,6 +1,9 @@
+#include "cuda/fp8/reference.h"
+#include "cuda/fp8/sm120.h"
 #include "cuda/nvfp4/reference.h"
 #include "cuda/nvfp4/sm120.h"
 #include "cuda/nvfp4/mlp.h"
+#include "gem16gb/fp8.h"
 #include "gem16gb/nvfp4.h"
 
 #include <cuda_runtime.h>
@@ -280,6 +283,111 @@ void TestMlpElementwiseBridge() {
   }
 }
 
+void TestFp8ReferenceAndDirectProjection() {
+  constexpr std::size_t rows = 8;
+  constexpr std::size_t k_size = 32;
+  std::array<float, k_size> host_activation{};
+  for (std::size_t index = 0; index < host_activation.size(); ++index) {
+    host_activation[index] =
+        static_cast<float>(static_cast<int>(index % 13U) - 6) * 0.125F;
+  }
+  const auto host_quantized = gem16gb::fp8::QuantizeToken(host_activation);
+  CUDA_TEST_CHECK(host_quantized.ok());
+  if (!host_quantized.ok()) return;
+
+  std::vector<std::uint8_t> host_weight(rows * k_size);
+  for (std::size_t row = 0; row < rows; ++row) {
+    for (std::size_t k = 0; k < k_size; ++k) {
+      const float value = static_cast<float>(static_cast<int>((row * 5U + k * 3U) % 15U) - 7) /
+                          4.0F;
+      const auto encoded = gem16gb::fp8::EncodeE4M3Fn(value);
+      CUDA_TEST_CHECK(encoded.ok());
+      if (!encoded.ok()) return;
+      host_weight[row * k_size + k] = encoded.value();
+    }
+  }
+  constexpr std::array<std::uint16_t, rows> host_weight_scales = {
+      0x3F80U, 0x3F00U, 0x3FC0U, 0x4000U, 0x3E80U, 0xBF80U, 0x4080U, 0x3F40U};
+  // The checkpoint contract requires positive scales; keep the synthetic fixture valid too.
+  std::array<std::uint16_t, rows> positive_weight_scales = host_weight_scales;
+  positive_weight_scales[5] = 0x3E00U;
+
+  DeviceBuffer<float> device_input(k_size);
+  DeviceBuffer<std::uint8_t> device_activation(k_size);
+  DeviceBuffer<float> device_activation_scale(1);
+  DeviceBuffer<std::uint8_t> device_weight(host_weight.size());
+  DeviceBuffer<std::uint16_t> device_weight_scales(rows);
+  DeviceBuffer<float> device_reference(rows);
+  DeviceBuffer<float> device_native(rows);
+  if (device_input.get() == nullptr || device_activation.get() == nullptr ||
+      device_activation_scale.get() == nullptr || device_weight.get() == nullptr ||
+      device_weight_scales.get() == nullptr || device_reference.get() == nullptr ||
+      device_native.get() == nullptr) {
+    return;
+  }
+  if (!CudaOk(cudaMemcpy(device_input.get(), host_activation.data(), device_input.bytes(),
+                         cudaMemcpyHostToDevice), "copy FP8 input") ||
+      !CudaOk(cudaMemcpy(device_weight.get(), host_weight.data(), device_weight.bytes(),
+                         cudaMemcpyHostToDevice), "copy FP8 weight") ||
+      !CudaOk(cudaMemcpy(device_weight_scales.get(), positive_weight_scales.data(),
+                         device_weight_scales.bytes(), cudaMemcpyHostToDevice),
+              "copy FP8 weight scales")) {
+    return;
+  }
+
+  const auto quantize_status = gem16gb::internal::LaunchFp8ReferenceTokenQuantization(
+      device_input.get(), device_activation.get(), device_activation_scale.get(), k_size, nullptr);
+  CUDA_TEST_CHECK(quantize_status.ok());
+  if (!quantize_status.ok() || !CudaOk(cudaDeviceSynchronize(), "FP8 quantize synchronize")) {
+    return;
+  }
+  std::array<std::uint8_t, k_size> gpu_activation{};
+  float gpu_scale = 0.0F;
+  CUDA_TEST_CHECK(CudaOk(cudaMemcpy(gpu_activation.data(), device_activation.get(),
+                                    device_activation.bytes(), cudaMemcpyDeviceToHost),
+                             "copy FP8 activation"));
+  CUDA_TEST_CHECK(CudaOk(cudaMemcpy(&gpu_scale, device_activation_scale.get(), sizeof(float),
+                                    cudaMemcpyDeviceToHost),
+                             "copy FP8 activation scale"));
+  CUDA_TEST_CHECK(gpu_scale == host_quantized.value().scale);
+  CUDA_TEST_CHECK(std::equal(gpu_activation.begin(), gpu_activation.end(),
+                             host_quantized.value().values_e4m3fn.begin()));
+
+  const auto reference_status = gem16gb::internal::LaunchFp8ReferenceProjection(
+      device_activation.get(), device_activation_scale.get(), device_weight.get(),
+      device_weight_scales.get(), device_reference.get(), rows, k_size, nullptr);
+  const auto native_status = gem16gb::internal::LaunchFp8Sm120DirectProjection(
+      device_activation.get(), device_activation_scale.get(), device_weight.get(),
+      device_weight_scales.get(), device_native.get(), rows, k_size, nullptr);
+  CUDA_TEST_CHECK(reference_status.ok());
+  CUDA_TEST_CHECK(native_status.ok());
+  if (!reference_status.ok() || !native_status.ok() ||
+      !CudaOk(cudaDeviceSynchronize(), "FP8 projection synchronize")) {
+    return;
+  }
+  std::array<float, rows> reference_output{};
+  std::array<float, rows> native_output{};
+  if (!CudaOk(cudaMemcpy(reference_output.data(), device_reference.get(), device_reference.bytes(),
+                         cudaMemcpyDeviceToHost), "copy FP8 reference output") ||
+      !CudaOk(cudaMemcpy(native_output.data(), device_native.get(), device_native.bytes(),
+                         cudaMemcpyDeviceToHost), "copy FP8 native output")) {
+    return;
+  }
+  for (std::size_t row = 0; row < rows; ++row) {
+    const auto expected = gem16gb::fp8::ReferenceDotProduct(
+        host_quantized.value(),
+        std::span<const std::uint8_t>(host_weight.data() + row * k_size, k_size),
+        positive_weight_scales[row]);
+    CUDA_TEST_CHECK(expected.ok());
+    if (expected.ok()) {
+      CUDA_TEST_CHECK(std::fabs(static_cast<double>(reference_output[row]) - expected.value()) <
+                         1.0e-4);
+      CUDA_TEST_CHECK(std::fabs(static_cast<double>(native_output[row]) - expected.value()) <
+                         1.0e-4);
+    }
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -291,6 +399,7 @@ int main() {
   TestCudaIntrinsicConformanceAndProjection();
   TestDirectSourceSm120Projection();
   TestMlpElementwiseBridge();
+  TestFp8ReferenceAndDirectProjection();
   if (failures != 0) {
     std::cerr << failures << " CUDA test assertion(s) failed\n";
     return 1;

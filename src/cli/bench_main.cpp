@@ -9,6 +9,7 @@
 
 #include "gem16gb/memory.h"
 #if GEM16GB_HAS_CUDA
+#include "cuda/fp8/checkpoint_probe.h"
 #include "cuda/nvfp4/checkpoint_probe.h"
 #endif
 
@@ -24,7 +25,7 @@ void Usage(std::ostream& output) {
          << "\n"
          << "Kernel mode (CUDA):\n"
          << "  gem16gb-bench kernel --model <checkpoint-dir>\n"
-         << "      [--projection <gate|up|down|mlp>]\n"
+         << "      [--projection <gate|up|down|mlp|q|k|v|o>]\n"
          << "      [--warmups <count>] [--iterations <count>]\n";
 }
 
@@ -117,8 +118,9 @@ int RunKernelMode(int argc, char** argv) {
     } else if (argument == "--projection" && index + 1 < argc) {
       projection = argv[++index];
       if (projection != "gate" && projection != "up" && projection != "down" &&
-          projection != "mlp") {
-        std::cerr << "error: --projection must be gate, up, down, or mlp\n";
+          projection != "mlp" && projection != "q" && projection != "k" &&
+          projection != "v" && projection != "o") {
+        std::cerr << "error: unsupported kernel projection\n";
         return 64;
       }
     } else if (argument == "--warmups" && index + 1 < argc) {
@@ -199,6 +201,62 @@ int RunKernelMode(int argc, char** argv) {
                    probe.reference_down_activation_bytes_match
                ? 0
                : 1;
+  }
+  if (projection == "q" || projection == "k" || projection == "v" || projection == "o") {
+    auto result = gem16gb::internal::RunLayer0Fp8CheckpointProbe(
+        model_directory, projection, warmups, iterations);
+    if (!result.ok()) {
+      std::cerr << "error: " << result.status().message() << '\n';
+      return 1;
+    }
+    const auto& probe = result.value();
+    std::cerr << "FP8 layer-0 " << projection << " checkpoint probe\n"
+              << "  tensor: " << probe.tensor_name << '\n'
+              << "  shape: " << probe.rows << " x " << probe.contracting_elements << '\n'
+              << "  CPU/GPU activation bytes and scale: "
+              << (probe.activation_bytes_match && probe.activation_scale_match ? "exact match"
+                                                                                : "MISMATCH")
+              << '\n'
+              << "  CUDA reference/native max abs: " << probe.reference_native_max_abs << '\n'
+              << "  SM120 direct average: " << probe.sm120_direct_ms << " ms\n";
+    std::cout << std::setprecision(17)
+              << "{\"schema_version\":1,\"status\":\"characterization\","
+              << "\"benchmark_qualified\":false,\"mode\":\"kernel\",\"fallbacks\":0,"
+              << "\"operator\":" << std::quoted("fp8_layer0_" + projection)
+              << ",\"tensor\":" << std::quoted(probe.tensor_name)
+              << ",\"shape\":[" << probe.rows << ',' << probe.contracting_elements << ']'
+              << ",\"precision\":\"w8a8_fp8_e4m3\",\"instruction\":"
+              << std::quoted(probe.instruction)
+              << ",\"source_layout_direct\":true,\"persistent_repack_bytes\":0"
+              << ",\"weight_bytes\":" << probe.weight_bytes
+              << ",\"weight_scale_bytes\":" << probe.weight_scale_bytes
+              << ",\"device_bytes\":" << probe.device_bytes
+              << ",\"activation_scale\":" << probe.activation_scale
+              << ",\"activation_bytes_match\":"
+              << (probe.activation_bytes_match ? "true" : "false")
+              << ",\"activation_scale_match\":"
+              << (probe.activation_scale_match ? "true" : "false")
+              << ",\"timing_ms\":{\"warmups\":" << warmups
+              << ",\"iterations\":" << iterations
+              << ",\"activation_quantize_average\":" << probe.activation_quantize_ms
+              << ",\"cuda_reference_single\":" << probe.cuda_reference_ms
+              << ",\"sm120_direct_average\":" << probe.sm120_direct_ms << '}'
+              << ",\"error\":{\"reference_native_max_abs\":"
+              << probe.reference_native_max_abs
+              << ",\"reference_native_rms\":" << probe.reference_native_rms
+              << ",\"reference_native_cosine\":" << probe.reference_native_cosine
+              << ",\"oracle_reference_max_abs\":" << probe.oracle_reference_max_abs
+              << ",\"oracle_native_max_abs\":" << probe.oracle_native_max_abs << '}'
+              << ",\"samples\":[";
+    for (std::size_t index = 0; index < probe.samples.size(); ++index) {
+      if (index != 0) std::cout << ',';
+      const auto& sample = probe.samples[index];
+      std::cout << "{\"row\":" << sample.row << ",\"oracle\":" << sample.oracle
+                << ",\"cuda_reference\":" << sample.cuda_reference
+                << ",\"sm120_direct\":" << sample.sm120_direct << '}';
+    }
+    std::cout << "]}\n";
+    return probe.activation_bytes_match && probe.activation_scale_match ? 0 : 1;
   }
   auto result = gem16gb::internal::RunLayer0Nvfp4CheckpointProbe(
       model_directory, projection, warmups, iterations);

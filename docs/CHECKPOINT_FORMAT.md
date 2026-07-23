@@ -19,6 +19,19 @@ layers contain named `v_proj` tensors; the eight full-attention layers omit `v_p
 unified K/V semantics. Execution must follow this per-layer inventory. Nibble order still requires byte-pattern
 validation before kernel work. No persistent repacked layout is defined.
 
+The implemented FP8 execution contract is:
+
+```text
+input_scale   = max(abs(a_real)) / 448          # one dynamic FP32 scale per token
+qa            = round_e4m3fn(a_real / input_scale)
+w_real[row,k] = qw_e4m3fn[row,k] * weight_scale_bf16[row]
+projection    = sum(qa[k] * qw[row,k]) * input_scale * weight_scale_bf16[row]
+```
+
+An all-zero token uses input scale `1.0`. CPU and CUDA implementations produce identical activation bytes and
+scale bits for the deterministic real-shape fixtures. Layer-0 Q/K/V/O consume source rows directly with
+`QMMA.16832.F32.E4M3.E4M3`; no persistent FP8 repack is required.
+
 Compressed-tensors stores the NVFP4 global values as divisors. For a stored weight divisor `gw`, input divisor
 `ga`, packed E2M1 values `qw`, and local E4M3FN scales `sw`, the expected W4A4 execution contract is:
 

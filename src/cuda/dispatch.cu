@@ -31,8 +31,10 @@ std::string CudaCapabilityReport() {
   output << "nvfp4_correctness_cuda=true\n"
          << "nvfp4_sm120_direct_experimental=true\n"
          << "native_nvfp4_kernels=false\n"
+         << "fp8_correctness_cuda=true\n"
+         << "fp8_sm120_direct_experimental=true\n"
          << "fp8_kernels=false\n"
-         << "status=NVFP4 operator bring-up only; real-shape and model qualification pending\n";
+         << "status=NVFP4 and FP8 real-shape operator bring-up; layer-golden and model qualification pending\n";
   return output.str();
 }
 

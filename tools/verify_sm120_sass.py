@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify that a CUDA binary contains the native SM120 NVFP4 MMA instruction."""
+"""Verify that a CUDA binary contains the required native SM120 MMA instructions."""
 
 from __future__ import annotations
 
@@ -11,7 +11,10 @@ import subprocess
 import sys
 
 
-EXPECTED = "OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X"
+EXPECTED = (
+    "OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X",
+    "QMMA.16832.F32.E4M3.E4M3",
+)
 
 
 def find_cuobjdump() -> str:
@@ -45,11 +48,16 @@ def main() -> int:
     if result.returncode != 0:
         print(result.stderr, file=sys.stderr)
         return result.returncode
-    count = result.stdout.count(EXPECTED)
-    if count == 0:
-        print(f"missing expected instruction: {EXPECTED}", file=sys.stderr)
+    missing = False
+    for instruction in EXPECTED:
+        count = result.stdout.count(instruction)
+        if count == 0:
+            print(f"missing expected instruction: {instruction}", file=sys.stderr)
+            missing = True
+        else:
+            print(f"verified {instruction}: occurrences={count}")
+    if missing:
         return 1
-    print(f"verified {EXPECTED}: occurrences={count}")
     return 0
 
 
