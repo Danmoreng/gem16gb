@@ -27,18 +27,26 @@ gem16gb::internal::ModelConfig PrimaryMemoryConfig() {
   return config;
 }
 
+gem16gb::TensorInfo MemoryTensor(const char* name, const char* quantization_class,
+                                 std::uint64_t byte_length,
+                                 bool loaded_in_text_only_mode = true) {
+  gem16gb::TensorInfo tensor;
+  tensor.name = name;
+  tensor.quantization_class = quantization_class;
+  tensor.byte_length = byte_length;
+  tensor.loaded_in_text_only_mode = loaded_in_text_only_mode;
+  return tensor;
+}
+
 gem16gb::ModelManifest PrimaryMemoryManifest() {
   gem16gb::ModelManifest manifest;
   manifest.tensors = {
-      {.name = "weights", .quantization_class = "BF16", .byte_length = 8'668'020'512},
-      {.name = "fp8_scales", .quantization_class = "FP8_WEIGHT_SCALE", .byte_length = 1'163'264},
-      {.name = "nvfp4_local_scales",
-       .quantization_class = "NVFP4_LOCAL_SCALE_E4M3",
-       .byte_length = 530'841'600},
-      {.name = "nvfp4_global_scales", .quantization_class = "NVFP4_GLOBAL_SCALE", .byte_length = 576},
-      {.name = "nvfp4_input_scales", .quantization_class = "NVFP4_INPUT_SCALE", .byte_length = 576},
-      {.name = "multimodal", .quantization_class = "BF16", .byte_length = 104'759'808,
-       .loaded_in_text_only_mode = false},
+      MemoryTensor("weights", "BF16", 8'668'020'512),
+      MemoryTensor("fp8_scales", "FP8_WEIGHT_SCALE", 1'163'264),
+      MemoryTensor("nvfp4_local_scales", "NVFP4_LOCAL_SCALE_E4M3", 530'841'600),
+      MemoryTensor("nvfp4_global_scales", "NVFP4_GLOBAL_SCALE", 576),
+      MemoryTensor("nvfp4_input_scales", "NVFP4_INPUT_SCALE", 576),
+      MemoryTensor("multimodal", "BF16", 104'759'808, false),
   };
   manifest.text_only_tensor_bytes = 9'200'026'528;
   manifest.skipped_tensor_bytes = 104'759'808;
