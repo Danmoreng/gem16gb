@@ -1,0 +1,53 @@
+[CmdletBinding()]
+param(
+    [switch]$Cuda,
+    [switch]$Sanitize,
+    [switch]$Test,
+    [switch]$ConfigureOnly,
+    [ValidateRange(0, 1024)]
+    [int]$Jobs = 0
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+. (Join-Path $PSScriptRoot "windows-toolchain.ps1")
+
+if ($Cuda -and $Sanitize) {
+    throw "-Cuda and -Sanitize select different presets and cannot be combined."
+}
+if ($Sanitize) {
+    throw "The host-sanitize preset requires GCC or Clang ASan/UBSan and is currently supported on Linux only."
+}
+
+$repoRoot = Split-Path -Parent $PSScriptRoot
+$preset = if ($Cuda) { "blackwell-release" } else { "host-debug" }
+
+Import-Gem16gbVisualStudioEnvironment
+Assert-Gem16gbCommand "cmake.exe" "Install CMake 3.28 or newer."
+Assert-Gem16gbCommand "ninja.exe" "Install Ninja or the Visual Studio CMake tools component."
+
+if ($Cuda) {
+    Import-Gem16gbCudaEnvironment
+    Assert-Gem16gbCommand "nvcc.exe" "Install the pinned NVIDIA CUDA toolkit and set CUDA_PATH."
+}
+
+Push-Location $repoRoot
+try {
+    Invoke-Gem16gbChecked "cmake.exe" @("--preset", $preset, "-S", $repoRoot)
+    if ($ConfigureOnly) {
+        return
+    }
+
+    $buildArguments = @("--build", "--preset", $preset, "--parallel")
+    if ($Jobs -gt 0) {
+        $buildArguments += $Jobs.ToString()
+    }
+    Invoke-Gem16gbChecked "cmake.exe" $buildArguments
+
+    if ($Test) {
+        Invoke-Gem16gbChecked "ctest.exe" @("--preset", $preset)
+    }
+} finally {
+    Pop-Location
+}

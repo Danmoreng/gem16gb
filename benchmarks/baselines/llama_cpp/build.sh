@@ -5,7 +5,7 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/../../.." && pwd)"
 expected_commit="$(tr -d '[:space:]' < "${script_dir}/commit.txt")"
 source_dir="${LLAMA_CPP_SOURCE:-${repo_root}/third_party/cache/llama.cpp}"
-build_dir="${LLAMA_CPP_BUILD_DIR:-${repo_root}/build/llama_cpp/release}"
+build_dir="${LLAMA_CPP_BUILD_DIR:-${repo_root}/build/Linux/llama_cpp/release}"
 
 if [[ ! -d "${source_dir}/.git" ]]; then
   mkdir -p "$(dirname -- "${source_dir}")"

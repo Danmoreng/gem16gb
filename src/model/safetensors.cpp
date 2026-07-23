@@ -1,18 +1,13 @@
 #include "model/safetensors.h"
 
 #include <algorithm>
-#include <cerrno>
-#include <cstring>
-#include <fcntl.h>
 #include <limits>
 #include <map>
 #include <set>
 #include <sstream>
 #include <string_view>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
+#include "platform/mapped_file.h"
 #include "util/json.h"
 
 namespace gem16gb::internal {
@@ -20,75 +15,6 @@ namespace {
 
 constexpr std::uint64_t kMaxHeaderBytes = 256U * 1024U * 1024U;
 constexpr std::uint64_t kMaxIndexBytes = 256U * 1024U * 1024U;
-
-class MappedFile {
- public:
-  MappedFile() = default;
-  MappedFile(const MappedFile&) = delete;
-  MappedFile& operator=(const MappedFile&) = delete;
-  MappedFile(MappedFile&& other) noexcept { Swap(other); }
-  MappedFile& operator=(MappedFile&& other) noexcept {
-    if (this != &other) {
-      Reset();
-      Swap(other);
-    }
-    return *this;
-  }
-  ~MappedFile() { Reset(); }
-
-  static Result<MappedFile> Open(const std::filesystem::path& path) {
-    MappedFile result;
-    result.fd_ = open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    if (result.fd_ < 0) {
-      return Status(StatusCode::kIoError, "cannot open " + path.string() + ": " + std::strerror(errno));
-    }
-    struct stat metadata {};
-    if (fstat(result.fd_, &metadata) != 0) {
-      return Status(StatusCode::kIoError, "cannot stat " + path.string() + ": " + std::strerror(errno));
-    }
-    if (metadata.st_size < 0) {
-      return Status(StatusCode::kDataLoss, "negative file size: " + path.string());
-    }
-    result.size_ = static_cast<std::uint64_t>(metadata.st_size);
-    if (result.size_ == 0) {
-      return Status(StatusCode::kDataLoss, "empty file: " + path.string());
-    }
-    if (result.size_ > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
-      return Status(StatusCode::kUnsupported, "file cannot be mapped in this address space: " + path.string());
-    }
-    result.data_ = mmap(nullptr, static_cast<std::size_t>(result.size_), PROT_READ, MAP_PRIVATE, result.fd_, 0);
-    if (result.data_ == MAP_FAILED) {
-      result.data_ = nullptr;
-      return Status(StatusCode::kIoError, "cannot mmap " + path.string() + ": " + std::strerror(errno));
-    }
-    return result;
-  }
-
-  [[nodiscard]] const std::byte* data() const { return static_cast<const std::byte*>(data_); }
-  [[nodiscard]] std::uint64_t size() const { return size_; }
-
- private:
-  void Reset() {
-    if (data_ != nullptr) {
-      (void)munmap(data_, static_cast<std::size_t>(size_));
-      data_ = nullptr;
-    }
-    if (fd_ >= 0) {
-      (void)close(fd_);
-      fd_ = -1;
-    }
-    size_ = 0;
-  }
-  void Swap(MappedFile& other) noexcept {
-    std::swap(fd_, other.fd_);
-    std::swap(data_, other.data_);
-    std::swap(size_, other.size_);
-  }
-
-  int fd_ = -1;
-  void* data_ = nullptr;
-  std::uint64_t size_ = 0;
-};
 
 std::uint64_t ReadLittleEndian64(const std::byte* bytes) {
   std::uint64_t result = 0;

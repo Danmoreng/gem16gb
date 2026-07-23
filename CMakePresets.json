@@ -5,8 +5,8 @@
     {
       "name": "host-debug",
       "displayName": "Host debug and tests",
-      "generator": "Unix Makefiles",
-      "binaryDir": "${sourceDir}/build/host-debug",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${hostSystemName}/host-debug",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
         "GEM16GB_ENABLE_CUDA": "OFF",
@@ -18,14 +18,19 @@
       "name": "host-sanitize",
       "displayName": "Host ASan and UBSan",
       "inherits": "host-debug",
-      "binaryDir": "${sourceDir}/build/host-sanitize",
+      "binaryDir": "${sourceDir}/build/${hostSystemName}/host-sanitize",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      },
       "cacheVariables": { "GEM16GB_ENABLE_SANITIZERS": "ON" }
     },
     {
       "name": "blackwell-release",
       "displayName": "16 GB Blackwell GPU release",
-      "generator": "Unix Makefiles",
-      "binaryDir": "${sourceDir}/build/blackwell-release",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${hostSystemName}/blackwell-release",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "GEM16GB_ENABLE_CUDA": "ON",
@@ -36,12 +41,21 @@
   ],
   "buildPresets": [
     { "name": "host-debug", "configurePreset": "host-debug" },
-    { "name": "host-sanitize", "configurePreset": "host-sanitize" },
+    {
+      "name": "host-sanitize",
+      "configurePreset": "host-sanitize",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" }
+    },
     { "name": "blackwell-release", "configurePreset": "blackwell-release" }
   ],
   "testPresets": [
     { "name": "host-debug", "configurePreset": "host-debug", "output": { "outputOnFailure": true } },
-    { "name": "host-sanitize", "configurePreset": "host-sanitize", "output": { "outputOnFailure": true } },
+    {
+      "name": "host-sanitize",
+      "configurePreset": "host-sanitize",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" },
+      "output": { "outputOnFailure": true }
+    },
     { "name": "blackwell-release", "configurePreset": "blackwell-release", "output": { "outputOnFailure": true } }
   ]
 }

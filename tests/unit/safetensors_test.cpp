@@ -1,12 +1,12 @@
 #include "test.h"
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <string>
-#include <unistd.h>
 #include <vector>
 
 #include "model/safetensors.h"
@@ -33,7 +33,8 @@ void WriteSafetensors(const std::filesystem::path& path, std::string header, std
 }  // namespace
 
 void RunSafetensorsTests() {
-  const auto root = std::filesystem::temp_directory_path() / ("gem16gb-safetensors-test-" + std::to_string(getpid()));
+  const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
+  const auto root = std::filesystem::temp_directory_path() / ("gem16gb-safetensors-test-" + std::to_string(unique));
   std::error_code error;
   std::filesystem::remove_all(root, error);
   std::filesystem::create_directories(root);
@@ -47,6 +48,14 @@ void RunSafetensorsTests() {
     GEM16GB_CHECK(valid.value()[0].name == "a");
     GEM16GB_CHECK(valid.value()[1].length == 4);
   }
+
+  std::u8string unicode_name = u8"checkpoint-";
+  unicode_name.push_back(static_cast<char8_t>(0xC3));
+  unicode_name.push_back(static_cast<char8_t>(0xA4));
+  const auto unicode_root = root / std::filesystem::path(unicode_name);
+  std::filesystem::create_directories(unicode_root);
+  WriteSafetensors(unicode_root / "model.safetensors", R"({"a":{"dtype":"U8","shape":[4],"data_offsets":[0,4]}})", 4);
+  GEM16GB_CHECK(gem16gb::internal::LoadSafetensorsDirectory(unicode_root).ok());
 
   WriteSafetensors(root / "model.safetensors",
                    R"({"a":{"dtype":"U8","shape":[4],"data_offsets":[0,4]},"b":{"dtype":"U8","shape":[4],"data_offsets":[2,6]}})", 6);
@@ -66,8 +75,17 @@ void RunSafetensorsTests() {
     index << R"({"weight_map":{"a":"linked.safetensors"}})";
   }
   std::filesystem::create_symlink(external, root / "linked.safetensors", error);
-  GEM16GB_CHECK(!error);
-  GEM16GB_CHECK(!gem16gb::internal::LoadSafetensorsDirectory(root).ok());
+  if (!error) {
+    GEM16GB_CHECK(!gem16gb::internal::LoadSafetensorsDirectory(root).ok());
+  } else {
+#if defined(_WIN32)
+    constexpr int kWindowsPrivilegeNotHeld = 1314;
+    GEM16GB_CHECK(error == std::errc::permission_denied || error == std::errc::operation_not_permitted ||
+                  error.value() == kWindowsPrivilegeNotHeld);
+#else
+    GEM16GB_CHECK(!error);
+#endif
+  }
 
   std::filesystem::remove_all(root, error);
   GEM16GB_CHECK(!error);

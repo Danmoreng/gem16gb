@@ -29,6 +29,11 @@ add_library(gem16gb_core STATIC
   src/runtime/capabilities.cpp
   src/util/json.cpp
 )
+if(WIN32)
+  target_sources(gem16gb_core PRIVATE src/platform/mapped_file_windows.cpp)
+else()
+  target_sources(gem16gb_core PRIVATE src/platform/mapped_file_posix.cpp)
+endif()
 # GCC 16 emits a false positive from std::variant's move constructor at -O3.
 # Keep the suppression local to the JSON translation unit.
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")

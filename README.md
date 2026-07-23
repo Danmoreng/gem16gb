@@ -11,13 +11,15 @@ approximately 16 GB of VRAM. The first model is the mixed FP8/NVFP4
 - `gem16gb-inspect` memory-maps a single Safetensors file or indexed shards, validates offsets and byte lengths,
   parses the compressed-tensors quantization schema, classifies all 1,389 tensors in the pinned snapshot, and
   exports JSON.
-- Host parser tests and opt-in ASan/UBSan builds work without CUDA.
+- Host parser tests work on Linux and Windows without CUDA. Linux also has opt-in ASan/UBSan builds.
 - An SM120a CUDA capability build is wired, but contains no inference kernels yet.
 
 Inference and benchmarks do **not** work yet. `gem16gb-run` and `gem16gb-bench` fail visibly and never fall back to a
 higher precision path.
 
-## Build
+## Build on Linux
+
+CMake 3.28+, Ninja, and a C++20 compiler are required.
 
 ```bash
 ./scripts/build.sh --host --test
@@ -27,11 +29,33 @@ For the CUDA capability probe with the pinned local toolkit:
 
 ```bash
 ./scripts/build.sh --cuda --test
-build/blackwell-release/bin/gem16gb-run --print-kernel-capabilities
+build/Linux/blackwell-release/bin/gem16gb-run --print-kernel-capabilities
 ```
 
 The CUDA build targets only `120a`. It does not claim native NVFP4 support until a representative kernel is
 implemented and its instructions are verified.
+
+## Build on Windows
+
+Use PowerShell from a regular terminal; the helper discovers Visual Studio 2022 Build Tools with `vswhere`, imports
+the x64 MSVC environment, and uses Ninja. CMake 3.28+, Ninja, and the Visual Studio C++ workload are required.
+
+```powershell
+.\scripts\build.ps1 -Test
+```
+
+For the CUDA capability probe, install the pinned CUDA toolkit. The helper uses `CUDA_PATH` when set and otherwise
+discovers toolkits installed in NVIDIA's standard Windows location:
+
+```powershell
+.\scripts\build.ps1 -Cuda -Test
+.\build\Windows\blackwell-release\bin\gem16gb-run.exe --print-kernel-capabilities
+```
+
+The target layout is the same on both operating systems, while CMake caches stay isolated under `build/Linux` and
+`build/Windows`. The `host-sanitize` preset is Linux-only because it currently uses GCC/Clang ASan and UBSan.
+The validated Windows development toolchain is recorded in `toolchains/windows-blackwell16gb.lock`; the Linux
+reference remains in `toolchains/blackwell16gb.lock`.
 
 ## Download the pinned checkpoint
 
@@ -42,16 +66,30 @@ python3 tools/fetch_model.py \
   --destination models/checkpoints/unsloth-gemma-4-12b-it-NVFP4-b1f6497
 ```
 
+On Windows, use `python` instead of `python3`; all Python tools use `pathlib` and accept native Windows paths.
+The trusted vLLM reference runtime remains Linux-only because upstream vLLM has no supported native Windows
+runtime; run those reference-generation and characterization commands on Linux rather than changing their
+semantics.
+
 The downloader resumes partial files, verifies sizes and SHA-256 digests, and never imports or executes code
 from the model repository.
 
 ## Inspect
 
 ```bash
-build/host-debug/bin/gem16gb-inspect \
+build/Linux/host-debug/bin/gem16gb-inspect \
   --model models/checkpoints/unsloth-gemma-4-12b-it-NVFP4-b1f6497 \
   --validate \
   --json manifest.json
+```
+
+The equivalent Windows command is:
+
+```powershell
+.\build\Windows\host-debug\bin\gem16gb-inspect.exe `
+  --model .\models\checkpoints\unsloth-gemma-4-12b-it-NVFP4-b1f6497 `
+  --validate `
+  --json .\manifest.json
 ```
 
 ## Hardware and limitations

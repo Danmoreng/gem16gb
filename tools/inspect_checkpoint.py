@@ -4,14 +4,21 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
+import platform
 import subprocess
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("model", type=Path)
-    parser.add_argument("--binary", type=Path, default=Path("build/host-debug/bin/gem16gb-inspect"))
+    executable = "gem16gb-inspect.exe" if os.name == "nt" else "gem16gb-inspect"
+    parser.add_argument(
+        "--binary",
+        type=Path,
+        default=Path("build") / platform.system() / "host-debug" / "bin" / executable,
+    )
     parser.add_argument("--json", type=Path)
     parser.add_argument("--validate", action="store_true")
     args = parser.parse_args()

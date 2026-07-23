@@ -2,6 +2,10 @@
 
 Current stage: Milestone 1, checkpoint inspector and loader.
 
+Linux and Windows host/CUDA build scaffolding is now available. This makes loader development and validation on the
+same Blackwell machine possible from either operating system; it does not move Windows production inference ahead
+of the correctness and native-kernel gates below.
+
 ## Active gate
 
 - Extend the now-committed trusted vLLM token/top-logprob fixture with full-vocabulary logits and selected hidden

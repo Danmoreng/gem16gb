@@ -32,6 +32,15 @@ benchmarks/baselines/llama_cpp/convert.sh \
   --dry-run
 ```
 
+On Windows, use the equivalent PowerShell entry point (and a venv under `Scripts\python.exe`):
+
+```powershell
+.\benchmarks\baselines\llama_cpp\convert.ps1 `
+  .\models\checkpoints\unsloth-gemma-4-12b-it-NVFP4-b1f6497 `
+  .\build\Windows\llama_cpp\gemma4-12b-nvfp4.gguf `
+  --dry-run
+```
+
 Prepare and run the patched converter in a separate ignored worktree:
 
 ```bash
@@ -41,12 +50,15 @@ benchmarks/baselines/llama_cpp/convert-patched.sh \
   build/llama_cpp/gemma4-12b-nvfp4-patched.gguf
 ```
 
+The patched PowerShell flow is likewise available as `prepare-patched-source.ps1` and `convert-patched.ps1`.
+
 The checkpoint tokenizer metadata requires Transformers 5 for this probe; Transformers 4.57.6 from upstream's
 legacy converter requirements fails while reading `extra_special_tokens`. The default patched command therefore
 uses the already pinned offline reference environment with Transformers 5.14.1. This is converter tooling only,
 not a runtime dependency.
 
-`build.sh` checks out the exact clean commit and builds CUDA tools specifically for SM120a. The build alone does
+`build.sh` and `build.ps1` check out the same exact clean commit and build CUDA tools specifically for SM120a. The
+PowerShell helper imports MSVC automatically and keeps its cache under `build/Windows/llama_cpp`. The build alone does
 not establish native NVFP4 execution. The selected GGUF has passed structural inspection, full GPU-residency
 probing, and an initial direct-runtime quality comparison; profiler-level native-instruction dispatch evidence is
 still required.

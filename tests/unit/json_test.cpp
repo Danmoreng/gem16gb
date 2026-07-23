@@ -16,7 +16,8 @@ void RunJsonTests() {
   }
 
   GEM16GB_CHECK(!gem16gb::json::Parse(R"({"duplicate":1,"duplicate":2})").ok());
-  GEM16GB_CHECK(!gem16gb::json::Parse(R"("\uD800")").ok());
+  const std::string invalid_surrogate{'"', '\\', 'u', 'D', '8', '0', '0', '"'};
+  GEM16GB_CHECK(!gem16gb::json::Parse(invalid_surrogate).ok());
   GEM16GB_CHECK(!gem16gb::json::Parse("[01]").ok());
   GEM16GB_CHECK(!gem16gb::json::Parse("{} trailing").ok());
   GEM16GB_CHECK(!gem16gb::json::Parse(std::string{"\"\xC0\x80\"", 4}).ok());

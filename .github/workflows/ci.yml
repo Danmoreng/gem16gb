@@ -1,11 +1,11 @@
-name: host-ci
+name: cross-platform-host-ci
 
 on:
   push:
   pull_request:
 
 jobs:
-  host:
+  linux-host:
     runs-on: ubuntu-24.04
     steps:
       - name: Fetch exact source revision
@@ -39,4 +39,29 @@ jobs:
             tools/inspect_gguf.py \
             tools/summarize_llama_bench.py
           python3 -m unittest discover -s tests/python -v
+        working-directory: source
+
+  windows-host:
+    runs-on: windows-2022
+    steps:
+      - name: Fetch exact source revision
+        shell: pwsh
+        env:
+          REPOSITORY: ${{ github.repository }}
+          REVISION: ${{ github.sha }}
+          SERVER: ${{ github.server_url }}
+        run: |
+          git init source
+          git -C source remote add origin "$env:SERVER/$env:REPOSITORY"
+          git -C source fetch --depth=1 origin "$env:REVISION"
+          git -C source checkout --detach FETCH_HEAD
+      - name: Configure, build, and test
+        shell: pwsh
+        run: .\scripts\build.ps1 -Test
+        working-directory: source
+      - name: Check Python tools
+        shell: pwsh
+        run: |
+          python -m py_compile tools/compare_manifests.py tools/benchmark_vllm.py tools/fetch_model.py tools/generate_golden.py tools/generate_llama_golden.py tools/inspect_checkpoint.py tools/inspect_gguf.py tools/summarize_llama_bench.py
+          python -m unittest discover -s tests/python -v
         working-directory: source
