@@ -28,9 +28,11 @@ std::string CudaCapabilityReport() {
   } else {
     output << "cuda_graphs=false\n";
   }
-  output << "native_nvfp4_kernels=false\n"
+  output << "nvfp4_correctness_cuda=true\n"
+         << "nvfp4_sm120_direct_experimental=true\n"
+         << "native_nvfp4_kernels=false\n"
          << "fp8_kernels=false\n"
-         << "status=CUDA runtime probe only; native kernels are not implemented\n";
+         << "status=NVFP4 operator bring-up only; real-shape and model qualification pending\n";
   return output.str();
 }
 

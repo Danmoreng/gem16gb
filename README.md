@@ -12,7 +12,13 @@ approximately 16 GB of VRAM. The first model is the mixed FP8/NVFP4
   parses the compressed-tensors quantization schema, classifies all 1,389 tensors in the pinned snapshot, and
   exports JSON.
 - Host parser tests work on Linux and Windows without CUDA. Linux also has opt-in ASan/UBSan builds.
-- An SM120a CUDA capability build is wired, but contains no inference kernels yet.
+- `gem16gb-bench memory` builds an aligned, deterministic base arena from the real text-only tensor inventory and
+  reports both shared and separate K/V cache sizes for every context profile.
+- The exact host NVFP4 codec covers E2M1, E4M3FN, dynamic-local activation quantization, compressed-tensors global
+  divisors, and a binary64 projection oracle with pinned-checkpoint byte fixtures.
+- The CUDA build contains an explicit correctness-only W4A4 projection and an experimental direct-source SM120a
+  projection. Synthetic tests prove CUDA intrinsic agreement and native block-scaled MMA output, but no complete
+  layer or model path is qualified yet.
 
 Inference and benchmarks do **not** work yet. `gem16gb-run` and `gem16gb-bench` fail visibly and never fall back to a
 higher precision path.
@@ -32,8 +38,9 @@ For the CUDA capability probe with the pinned local toolkit:
 build/Linux/blackwell-release/bin/gem16gb-run --print-kernel-capabilities
 ```
 
-The CUDA build targets only `120a`. It does not claim native NVFP4 support until a representative kernel is
-implemented and its instructions are verified.
+The CUDA build targets only `120a`. Its experimental projection disassembles to
+`OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X`, but the capability report deliberately remains
+`native_nvfp4_kernels=false` until real-shape, layer, logit, and benchmark gates pass.
 
 ## Build on Windows
 
@@ -91,6 +98,21 @@ The equivalent Windows command is:
   --validate `
   --json .\manifest.json
 ```
+
+## Plan memory
+
+K/V sharing is not assumed silently. Select the intended storage explicitly; the JSON result also contains the
+alternative size:
+
+```powershell
+.\build\Windows\host-debug\bin\gem16gb-bench.exe memory `
+  --model .\models\checkpoints\unsloth-gemma-4-12b-it-NVFP4-b1f6497 `
+  --profile long `
+  --kv-storage shared
+```
+
+The current base plan covers immutable text weights, scales, and KV payload. Activation, graph, sampling, kernel,
+and prefill workspaces remain explicitly marked as unplanned rather than being estimated without an execution plan.
 
 ## Hardware and limitations
 

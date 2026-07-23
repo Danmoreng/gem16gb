@@ -18,3 +18,17 @@ Attention projection weights are E4M3 with BF16 per-output-channel `.weight_scal
 layers contain named `v_proj` tensors; the eight full-attention layers omit `v_proj` weight and scale tensors under
 unified K/V semantics. Execution must follow this per-layer inventory. Nibble order still requires byte-pattern
 validation before kernel work. No persistent repacked layout is defined.
+
+Compressed-tensors stores the NVFP4 global values as divisors. For a stored weight divisor `gw`, input divisor
+`ga`, packed E2M1 values `qw`, and local E4M3FN scales `sw`, the expected W4A4 execution contract is:
+
+```text
+w_real       = qw * sw / gw
+a_scaled     = a_real * ga
+a_scaled     ~= qa * sa                 # dynamic E2M1 plus E4M3FN scale per 16 values
+projection   = sum(qa * sa * qw * sw) / (ga * gw)
+```
+
+This interpretation must be verified against the pinned trusted runtime and CPU oracle before it becomes a kernel
+contract. Gate and Up divisors are bit-identical for all 48 layers in the pinned checkpoint. All 530,841,600 bytes
+of the 144 MLP local-scale tensors are positive, nonzero, and avoid the E4M3FN NaN encoding.

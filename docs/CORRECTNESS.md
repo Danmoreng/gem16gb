@@ -15,10 +15,29 @@ offset, byte length, shard, and alignment; total tensor payload is 9,304,786,336
 validated decoder inventory contains 29 tensors in every sliding-attention layer and 27 in every full-attention
 layer; full-attention layers omit separate `v_proj` weight and scale tensors.
 
+Level 1 NVFP4 bring-up now includes a platform-independent E2M1 and E4M3FN codec, round-to-nearest-even host
+encoding, dynamic-local activation quantization in groups of 16, compressed-tensors global-divisor application, and
+a binary64 W4A4 projection oracle. Tests exhaustively round-trip all finite E4M3FN words and all E2M1 nibbles,
+exercise rounding, saturation, and error behavior, and pin the first 16 packed values and first local scale from
+layer 0 Gate row 0 of the locked checkpoint.
+
+The CUDA correctness route independently uses CUDA 13.3 FP4/FP8 conversion types, matches the host packed
+activation and scale bytes, and matches the host projection oracle. A separate experimental SM120a kernel consumes
+the compact source weight and scale layouts directly; its synthetic eight-row/64-K output matches the same oracle.
+Disassembly of the CUDA test binary contains `OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X`. This is instruction-path
+evidence only, not yet a real-shape or production-kernel qualification.
+
+Reproduce the instruction check with:
+
+```bash
+python tools/verify_sm120_sass.py build/<OS>/blackwell-release/bin/gem16gb-cuda-tests
+```
+
 ## Not yet established
 
-Operator tolerances, full-vocabulary logits, hidden-state comparisons, cross-engine generation agreement, and task
-quality have not been measured. Therefore `tests/tolerances.yaml` is intentionally empty. The committed vLLM
+Real-shape projection distributions, layer tolerances, full-vocabulary logits, hidden-state comparisons,
+cross-engine generation agreement, and task quality have not been measured. Therefore `tests/tolerances.yaml` is
+intentionally empty. The committed vLLM
 fixture provides greedy token IDs and top-20 log probabilities, but it is not a substitute for full-logit Level 3
 metrics. Tolerances will be added only after reference distributions exist.
 
