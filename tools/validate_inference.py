@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""Validate the full 48-layer greedy characterization against a pinned fixture."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+from pathlib import Path
+import subprocess
+import sys
+from typing import Any
+
+
+class ValidationError(RuntimeError):
+    pass
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run", type=Path, required=True)
+    parser.add_argument("--model", type=Path, required=True)
+    parser.add_argument(
+        "--golden",
+        type=Path,
+        default=Path("tests/golden/vllm-gemma4-12b-nvfp4.json"),
+    )
+    parser.add_argument("--prompt-id", default="exact_blue_no_thinking")
+    parser.add_argument("--output", type=Path)
+    return parser.parse_args()
+
+
+def select_prompt(document: dict[str, Any], prompt_id: str) -> dict[str, Any]:
+    prompts = document.get("prompts")
+    if not isinstance(prompts, list):
+        raise ValidationError("golden fixture has no prompt list")
+    for prompt in prompts:
+        if isinstance(prompt, dict) and prompt.get("id") == prompt_id:
+            return prompt
+    raise ValidationError(f"golden fixture has no prompt named {prompt_id!r}")
+
+
+def validate_result(document: dict[str, Any], expected: list[int]) -> None:
+    if document.get("status") != "characterization":
+        raise ValidationError("inference did not report characterization status")
+    if document.get("benchmark_qualified") is not False:
+        raise ValidationError("inference must not claim benchmark qualification")
+    if document.get("fallbacks") != 0:
+        raise ValidationError("inference used a precision fallback")
+    if document.get("source_layout_direct") is not True:
+        raise ValidationError("inference did not consume the source layout directly")
+    if document.get("token_loop_allocations") is not False:
+        raise ValidationError("inference reported token-loop allocations")
+    if document.get("output_token_ids") != expected:
+        raise ValidationError(
+            f"greedy tokens differ: expected {expected}, got {document.get('output_token_ids')}"
+        )
+    for field in ("model_load_ms", "prompt_ms", "decode_ms", "decode_tokens_per_second"):
+        value = document.get(field)
+        if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise ValidationError(f"inference has invalid {field}")
+    if len(expected) > 1 and document["decode_tokens_per_second"] <= 0:
+        raise ValidationError("inference did not report positive decode throughput")
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        run = args.run.resolve(strict=True)
+        model = args.model.resolve(strict=True)
+        golden_path = args.golden.resolve(strict=True)
+        golden = json.loads(golden_path.read_text(encoding="utf-8"))
+        prompt = select_prompt(golden, args.prompt_id)
+        input_ids = prompt.get("prompt_token_ids")
+        expected = prompt.get("output_token_ids")
+        if not isinstance(input_ids, list) or not input_ids or not all(
+            isinstance(token, int) and token >= 0 for token in input_ids
+        ):
+            raise ValidationError("golden prompt token IDs are malformed")
+        if not isinstance(expected, list) or not expected or not all(
+            isinstance(token, int) and token >= 0 for token in expected
+        ):
+            raise ValidationError("golden output token IDs are malformed")
+        context = len(input_ids) + len(expected)
+        command = [
+            str(run),
+            "--model",
+            str(model),
+            "--input-token-ids",
+            ",".join(str(token) for token in input_ids),
+            "--max-tokens",
+            str(len(expected)),
+            "--max-context",
+            str(context),
+            "--greedy",
+        ]
+        completed = subprocess.run(command, check=False, capture_output=True, text=True)
+        if completed.returncode != 0:
+            raise ValidationError(
+                f"inference failed with exit code {completed.returncode}: "
+                f"{completed.stderr.strip()}"
+            )
+        try:
+            inference = json.loads(completed.stdout)
+        except json.JSONDecodeError as error:
+            raise ValidationError(f"inference emitted invalid JSON: {error}") from error
+        validate_result(inference, expected)
+        result = {
+            "schema_version": 1,
+            "status": "ok",
+            "benchmark_qualified": False,
+            "prompt_id": args.prompt_id,
+            "expected_output_token_ids": expected,
+            "inference": inference,
+        }
+        if args.output is not None:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(
+                json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    except (json.JSONDecodeError, OSError, ValidationError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

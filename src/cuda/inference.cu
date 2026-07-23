@@ -1,0 +1,908 @@
+#include "gem16gb/engine.h"
+
+#include "cuda/fp8/reference.h"
+#include "cuda/fp8/sm120.h"
+#include "cuda/layer/reference.h"
+#include "cuda/nvfp4/mlp.h"
+#include "cuda/nvfp4/reference.h"
+#include "cuda/nvfp4/sm120.h"
+#include "gem16gb/model.h"
+#include "platform/mapped_file.h"
+
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <cfloat>
+#include <chrono>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+#include <ostream>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+namespace gem16gb {
+namespace {
+
+constexpr std::uint64_t kHidden = 3840;
+constexpr std::uint64_t kIntermediate = 15360;
+constexpr std::uint64_t kVocabulary = 262144;
+constexpr std::uint64_t kQueryHeads = 16;
+constexpr std::uint64_t kLayers = 48;
+constexpr std::uint64_t kSlidingWindow = 1024;
+constexpr std::uint64_t kAlignment = 256;
+constexpr float kEpsilon = 1.0e-6F;
+constexpr unsigned kThreads = 256;
+
+Status Error(StatusCode code, std::string message) {
+  return Status(code, std::move(message));
+}
+
+Status CudaFailure(const char* operation, cudaError_t error) {
+  return Error(StatusCode::kInternal,
+               std::string(operation) + ": " + cudaGetErrorName(error) + ": " +
+                   cudaGetErrorString(error));
+}
+
+Result<std::uint64_t> AlignUp(std::uint64_t value, std::uint64_t alignment) {
+  if (alignment == 0U || (alignment & (alignment - 1U)) != 0U) {
+    return Error(StatusCode::kInternal, "arena alignment is not a power of two");
+  }
+  const std::uint64_t mask = alignment - 1U;
+  if (value > std::numeric_limits<std::uint64_t>::max() - mask) {
+    return Error(StatusCode::kInternal, "arena offset overflow");
+  }
+  return (value + mask) & ~mask;
+}
+
+class DeviceAllocation {
+ public:
+  DeviceAllocation() = default;
+  DeviceAllocation(const DeviceAllocation&) = delete;
+  DeviceAllocation& operator=(const DeviceAllocation&) = delete;
+  ~DeviceAllocation() {
+    if (data_ != nullptr) (void)cudaFree(data_);
+  }
+
+  [[nodiscard]] Status Allocate(std::uint64_t bytes, const char* label) {
+    if (data_ != nullptr || bytes == 0U || bytes > std::numeric_limits<std::size_t>::max()) {
+      return Error(StatusCode::kInvalidArgument, std::string(label) + " size is invalid");
+    }
+    const cudaError_t error = cudaMalloc(&data_, static_cast<std::size_t>(bytes));
+    if (error != cudaSuccess) return CudaFailure(label, error);
+    bytes_ = bytes;
+    return Status::Ok();
+  }
+
+  [[nodiscard]] std::byte* data() const { return static_cast<std::byte*>(data_); }
+  [[nodiscard]] std::uint64_t bytes() const { return bytes_; }
+
+ private:
+  void* data_ = nullptr;
+  std::uint64_t bytes_ = 0;
+};
+
+struct DeviceTensor {
+  const TensorInfo* info = nullptr;
+  std::byte* data = nullptr;
+  float scalar_f32 = 0.0F;
+  bool has_scalar_f32 = false;
+};
+
+struct Fp8Binding {
+  const std::uint8_t* weight = nullptr;
+  const std::uint16_t* scales = nullptr;
+  std::uint64_t rows = 0;
+  std::uint64_t contracting = 0;
+};
+
+struct Nvfp4Binding {
+  const std::uint8_t* packed_weight = nullptr;
+  const std::uint8_t* scales = nullptr;
+  float input_divisor = 0.0F;
+  float weight_divisor = 0.0F;
+  std::uint64_t rows = 0;
+  std::uint64_t contracting = 0;
+};
+
+struct LayerBinding {
+  bool global = false;
+  std::uint64_t kv_heads = 0;
+  std::uint64_t head_dimension = 0;
+  std::uint64_t query_elements = 0;
+  std::uint64_t kv_elements = 0;
+  Fp8Binding q;
+  Fp8Binding k;
+  Fp8Binding v;
+  Fp8Binding o;
+  Nvfp4Binding gate;
+  Nvfp4Binding up;
+  Nvfp4Binding down;
+  const std::uint16_t* input_norm = nullptr;
+  const std::uint16_t* q_norm = nullptr;
+  const std::uint16_t* k_norm = nullptr;
+  const std::uint16_t* post_attention_norm = nullptr;
+  const std::uint16_t* pre_mlp_norm = nullptr;
+  const std::uint16_t* post_mlp_norm = nullptr;
+  const std::uint16_t* layer_scalar = nullptr;
+  float* key_cache = nullptr;
+  float* value_cache = nullptr;
+};
+
+class LoadedModel {
+ public:
+  [[nodiscard]] Status Load(const std::filesystem::path& directory) {
+    auto inspected = InspectCheckpoint({directory, true});
+    if (!inspected.ok()) return inspected.status();
+    manifest_ = std::move(inspected).value();
+
+    std::uint64_t arena_bytes = 0;
+    for (const auto& tensor : manifest_.tensors) {
+      if (!tensor.loaded_in_text_only_mode) continue;
+      auto aligned = AlignUp(arena_bytes, kAlignment);
+      if (!aligned.ok()) return aligned.status();
+      if (tensor.byte_length > std::numeric_limits<std::uint64_t>::max() - aligned.value()) {
+        return Error(StatusCode::kInternal, "weight arena size overflow");
+      }
+      arena_bytes = aligned.value() + tensor.byte_length;
+    }
+    auto final_size = AlignUp(arena_bytes, kAlignment);
+    if (!final_size.ok()) return final_size.status();
+    Status status = weights_.Allocate(final_size.value(), "allocate text-only weight arena");
+    if (!status.ok()) return status;
+
+    std::uint64_t offset = 0;
+    for (const auto& tensor : manifest_.tensors) {
+      if (!tensor.loaded_in_text_only_mode) continue;
+      auto aligned = AlignUp(offset, kAlignment);
+      if (!aligned.ok()) return aligned.status();
+      DeviceTensor view;
+      view.info = &tensor;
+      view.data = weights_.data() + aligned.value();
+      const auto inserted = tensors_.emplace(tensor.name, view);
+      if (!inserted.second) {
+        return Error(StatusCode::kDataLoss, "duplicate device tensor: " + tensor.name);
+      }
+      offset = aligned.value() + tensor.byte_length;
+    }
+
+    std::unordered_set<std::string> shards;
+    for (const auto& tensor : manifest_.tensors) {
+      if (tensor.loaded_in_text_only_mode) shards.insert(tensor.source_shard);
+    }
+    for (const auto& shard : shards) {
+      auto mapped = internal::MappedFile::Open(directory / shard);
+      if (!mapped.ok()) return mapped.status();
+      for (auto& [name, view] : tensors_) {
+        (void)name;
+        const TensorInfo& tensor = *view.info;
+        if (tensor.source_shard != shard) continue;
+        if (tensor.byte_offset > mapped.value().size() ||
+            tensor.byte_length > mapped.value().size() - tensor.byte_offset) {
+          return Error(StatusCode::kDataLoss, "tensor upload range is invalid: " + tensor.name);
+        }
+        const std::byte* source = mapped.value().data() + tensor.byte_offset;
+        const cudaError_t error = cudaMemcpy(view.data, source,
+                                             static_cast<std::size_t>(tensor.byte_length),
+                                             cudaMemcpyHostToDevice);
+        if (error != cudaSuccess) return CudaFailure("upload checkpoint tensor", error);
+        if (tensor.storage_dtype == "F32" && tensor.byte_length == sizeof(float)) {
+          std::uint32_t bits = 0;
+          std::memcpy(&bits, source, sizeof(bits));
+          view.scalar_f32 = std::bit_cast<float>(bits);
+          view.has_scalar_f32 = true;
+        }
+      }
+    }
+    return Bind();
+  }
+
+  [[nodiscard]] const std::array<LayerBinding, kLayers>& layers() const { return layers_; }
+  [[nodiscard]] const std::uint16_t* embedding() const { return embedding_; }
+  [[nodiscard]] const std::uint16_t* final_norm() const { return final_norm_; }
+  [[nodiscard]] std::uint64_t weight_bytes() const { return weights_.bytes(); }
+
+  void SetLayerCache(std::size_t layer, float* key, float* value) {
+    layers_[layer].key_cache = key;
+    layers_[layer].value_cache = value;
+  }
+
+ private:
+  [[nodiscard]] Result<const DeviceTensor*> Tensor(const std::string& name) const {
+    const auto found = tensors_.find(name);
+    if (found == tensors_.end()) {
+      return Error(StatusCode::kNotFound, "required inference tensor is missing: " + name);
+    }
+    return &found->second;
+  }
+
+  [[nodiscard]] Result<const std::uint16_t*> Bf16(const std::string& name,
+                                                  std::uint64_t elements) const {
+    auto tensor = Tensor(name);
+    if (!tensor.ok()) return tensor.status();
+    if (tensor.value()->info->storage_dtype != "BF16" ||
+        tensor.value()->info->byte_length != elements * sizeof(std::uint16_t)) {
+      return Error(StatusCode::kDataLoss, "unexpected BF16 tensor geometry: " + name);
+    }
+    return reinterpret_cast<const std::uint16_t*>(tensor.value()->data);
+  }
+
+  [[nodiscard]] Result<Fp8Binding> Fp8(const std::string& name, std::uint64_t rows,
+                                       std::uint64_t contracting) const {
+    auto weight = Tensor(name + ".weight");
+    auto scales = Tensor(name + ".weight_scale");
+    if (!weight.ok()) return weight.status();
+    if (!scales.ok()) return scales.status();
+    if (weight.value()->info->storage_dtype != "F8_E4M3" ||
+        weight.value()->info->shape != std::vector<std::uint64_t>{rows, contracting} ||
+        scales.value()->info->storage_dtype != "BF16" ||
+        scales.value()->info->shape != std::vector<std::uint64_t>{rows, 1U}) {
+      return Error(StatusCode::kDataLoss, "unexpected FP8 tensor geometry: " + name);
+    }
+    return Fp8Binding{reinterpret_cast<const std::uint8_t*>(weight.value()->data),
+                      reinterpret_cast<const std::uint16_t*>(scales.value()->data), rows,
+                      contracting};
+  }
+
+  [[nodiscard]] Result<Nvfp4Binding> Nvfp4(const std::string& name, std::uint64_t rows,
+                                           std::uint64_t contracting) const {
+    auto packed = Tensor(name + ".weight_packed");
+    auto scales = Tensor(name + ".weight_scale");
+    auto input = Tensor(name + ".input_global_scale");
+    auto weight = Tensor(name + ".weight_global_scale");
+    if (!packed.ok()) return packed.status();
+    if (!scales.ok()) return scales.status();
+    if (!input.ok()) return input.status();
+    if (!weight.ok()) return weight.status();
+    if (packed.value()->info->storage_dtype != "U8" ||
+        packed.value()->info->logical_shape != std::vector<std::uint64_t>{rows, contracting} ||
+        scales.value()->info->storage_dtype != "F8_E4M3" ||
+        scales.value()->info->shape != std::vector<std::uint64_t>{rows, contracting / 16U} ||
+        !input.value()->has_scalar_f32 || !weight.value()->has_scalar_f32 ||
+        !std::isfinite(input.value()->scalar_f32) || input.value()->scalar_f32 <= 0.0F ||
+        !std::isfinite(weight.value()->scalar_f32) || weight.value()->scalar_f32 <= 0.0F) {
+      return Error(StatusCode::kDataLoss, "unexpected NVFP4 tensor family: " + name);
+    }
+    return Nvfp4Binding{reinterpret_cast<const std::uint8_t*>(packed.value()->data),
+                        reinterpret_cast<const std::uint8_t*>(scales.value()->data),
+                        input.value()->scalar_f32, weight.value()->scalar_f32, rows,
+                        contracting};
+  }
+
+  [[nodiscard]] Status Bind() {
+    auto embedding = Bf16("model.language_model.embed_tokens.weight", kVocabulary * kHidden);
+    auto final_norm = Bf16("model.language_model.norm.weight", kHidden);
+    if (!embedding.ok()) return embedding.status();
+    if (!final_norm.ok()) return final_norm.status();
+    embedding_ = embedding.value();
+    final_norm_ = final_norm.value();
+
+    for (std::size_t index = 0; index < layers_.size(); ++index) {
+      LayerBinding& layer = layers_[index];
+      layer.global = index % 6U == 5U;
+      layer.kv_heads = layer.global ? 1U : 8U;
+      layer.head_dimension = layer.global ? 512U : 256U;
+      layer.query_elements = kQueryHeads * layer.head_dimension;
+      layer.kv_elements = layer.kv_heads * layer.head_dimension;
+      const std::string base = "model.language_model.layers." + std::to_string(index) + ".";
+
+      auto q = Fp8(base + "self_attn.q_proj", layer.query_elements, kHidden);
+      auto k = Fp8(base + "self_attn.k_proj", layer.kv_elements, kHidden);
+      auto o = Fp8(base + "self_attn.o_proj", kHidden, layer.query_elements);
+      if (!q.ok()) return q.status();
+      if (!k.ok()) return k.status();
+      if (!o.ok()) return o.status();
+      layer.q = q.value();
+      layer.k = k.value();
+      layer.o = o.value();
+      if (!layer.global) {
+        auto v = Fp8(base + "self_attn.v_proj", layer.kv_elements, kHidden);
+        if (!v.ok()) return v.status();
+        layer.v = v.value();
+      }
+
+      auto gate = Nvfp4(base + "mlp.gate_proj", kIntermediate, kHidden);
+      auto up = Nvfp4(base + "mlp.up_proj", kIntermediate, kHidden);
+      auto down = Nvfp4(base + "mlp.down_proj", kHidden, kIntermediate);
+      if (!gate.ok()) return gate.status();
+      if (!up.ok()) return up.status();
+      if (!down.ok()) return down.status();
+      if (std::bit_cast<std::uint32_t>(gate.value().input_divisor) !=
+          std::bit_cast<std::uint32_t>(up.value().input_divisor)) {
+        return Error(StatusCode::kDataLoss,
+                     "Gate and Up input divisors differ in layer " + std::to_string(index));
+      }
+      layer.gate = gate.value();
+      layer.up = up.value();
+      layer.down = down.value();
+
+      auto input_norm = Bf16(base + "input_layernorm.weight", kHidden);
+      auto q_norm = Bf16(base + "self_attn.q_norm.weight", layer.head_dimension);
+      auto k_norm = Bf16(base + "self_attn.k_norm.weight", layer.head_dimension);
+      auto post_attention = Bf16(base + "post_attention_layernorm.weight", kHidden);
+      auto pre_mlp = Bf16(base + "pre_feedforward_layernorm.weight", kHidden);
+      auto post_mlp = Bf16(base + "post_feedforward_layernorm.weight", kHidden);
+      auto scalar = Bf16(base + "layer_scalar", 1U);
+      if (!input_norm.ok()) return input_norm.status();
+      if (!q_norm.ok()) return q_norm.status();
+      if (!k_norm.ok()) return k_norm.status();
+      if (!post_attention.ok()) return post_attention.status();
+      if (!pre_mlp.ok()) return pre_mlp.status();
+      if (!post_mlp.ok()) return post_mlp.status();
+      if (!scalar.ok()) return scalar.status();
+      layer.input_norm = input_norm.value();
+      layer.q_norm = q_norm.value();
+      layer.k_norm = k_norm.value();
+      layer.post_attention_norm = post_attention.value();
+      layer.pre_mlp_norm = pre_mlp.value();
+      layer.post_mlp_norm = post_mlp.value();
+      layer.layer_scalar = scalar.value();
+    }
+    return Status::Ok();
+  }
+
+  ModelManifest manifest_;
+  DeviceAllocation weights_;
+  std::unordered_map<std::string, DeviceTensor> tensors_;
+  std::array<LayerBinding, kLayers> layers_{};
+  const std::uint16_t* embedding_ = nullptr;
+  const std::uint16_t* final_norm_ = nullptr;
+};
+
+struct WorkspaceOffsets {
+  std::uint64_t hidden_a = 0;
+  std::uint64_t hidden_b = 0;
+  std::uint64_t normalized = 0;
+  std::uint64_t fp8_activation = 0;
+  std::uint64_t fp8_scale = 0;
+  std::uint64_t q = 0;
+  std::uint64_t k = 0;
+  std::uint64_t v = 0;
+  std::uint64_t q_norm = 0;
+  std::uint64_t k_norm = 0;
+  std::uint64_t v_norm = 0;
+  std::uint64_t scores = 0;
+  std::uint64_t attention = 0;
+  std::uint64_t o_activation = 0;
+  std::uint64_t o_scale = 0;
+  std::uint64_t projection = 0;
+  std::uint64_t post_norm = 0;
+  std::uint64_t mlp_packed = 0;
+  std::uint64_t mlp_scales = 0;
+  std::uint64_t gate = 0;
+  std::uint64_t up = 0;
+  std::uint64_t product = 0;
+  std::uint64_t down_packed = 0;
+  std::uint64_t down_scales = 0;
+  std::uint64_t logits = 0;
+  std::uint64_t selected = 0;
+  std::uint64_t total = 0;
+};
+
+class LayoutBuilder {
+ public:
+  template <typename T>
+  [[nodiscard]] Result<std::uint64_t> Add(std::uint64_t elements) {
+    auto aligned = AlignUp(offset_, std::max<std::uint64_t>(alignof(T), 16U));
+    if (!aligned.ok()) return aligned.status();
+    if (elements > std::numeric_limits<std::uint64_t>::max() / sizeof(T) ||
+        elements * sizeof(T) > std::numeric_limits<std::uint64_t>::max() - aligned.value()) {
+      return Error(StatusCode::kInternal, "workspace size overflow");
+    }
+    offset_ = aligned.value() + elements * sizeof(T);
+    return aligned.value();
+  }
+  [[nodiscard]] std::uint64_t size() const { return offset_; }
+
+ private:
+  std::uint64_t offset_ = 0;
+};
+
+template <typename T>
+T* Pointer(DeviceAllocation& arena, std::uint64_t offset) {
+  return reinterpret_cast<T*>(arena.data() + offset);
+}
+
+__global__ void RoundBf16Kernel(float* values, std::uint64_t elements) {
+  const std::uint64_t index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index < elements) values[index] = static_cast<float>(__float2bfloat16_rn(values[index]));
+}
+
+__global__ void EmbeddingKernel(const std::uint16_t* weights, std::uint32_t token, float* output) {
+  const std::uint64_t index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= kHidden) return;
+  const float weight = static_cast<float>(__ushort_as_bfloat16(weights[
+      static_cast<std::uint64_t>(token) * kHidden + index]));
+  const float scale = static_cast<float>(__float2bfloat16_rn(sqrtf(static_cast<float>(kHidden))));
+  output[index] = static_cast<float>(__float2bfloat16_rn(weight * scale));
+}
+
+__device__ float BlockSum(float value) {
+  __shared__ float scratch[kThreads];
+  scratch[threadIdx.x] = value;
+  __syncthreads();
+  for (unsigned stride = kThreads / 2U; stride != 0U; stride >>= 1U) {
+    if (threadIdx.x < stride) scratch[threadIdx.x] += scratch[threadIdx.x + stride];
+    __syncthreads();
+  }
+  return scratch[0];
+}
+
+__global__ void OutputHeadKernel(const std::uint16_t* weights, const float* hidden,
+                                 float* logits) {
+  const std::uint64_t token = blockIdx.x;
+  float sum = 0.0F;
+  const std::uint64_t base = token * kHidden;
+  for (std::uint64_t index = threadIdx.x; index < kHidden; index += blockDim.x) {
+    const float weight = static_cast<float>(__ushort_as_bfloat16(weights[base + index]));
+    sum = fmaf(weight, hidden[index], sum);
+  }
+  const float logit = BlockSum(sum);
+  if (threadIdx.x == 0U) logits[token] = tanhf(logit / 30.0F) * 30.0F;
+}
+
+struct ArgmaxValue {
+  float value;
+  std::uint32_t token;
+};
+
+__global__ void ArgmaxKernel(const float* logits, std::uint32_t* selected) {
+  __shared__ ArgmaxValue scratch[kThreads];
+  ArgmaxValue best{-FLT_MAX, 0U};
+  for (std::uint64_t index = threadIdx.x; index < kVocabulary; index += blockDim.x) {
+    const float value = logits[index];
+    if (value > best.value || (value == best.value && index < best.token)) {
+      best = {value, static_cast<std::uint32_t>(index)};
+    }
+  }
+  scratch[threadIdx.x] = best;
+  __syncthreads();
+  for (unsigned stride = kThreads / 2U; stride != 0U; stride >>= 1U) {
+    if (threadIdx.x < stride) {
+      const ArgmaxValue other = scratch[threadIdx.x + stride];
+      if (other.value > scratch[threadIdx.x].value ||
+          (other.value == scratch[threadIdx.x].value &&
+           other.token < scratch[threadIdx.x].token)) {
+        scratch[threadIdx.x] = other;
+      }
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0U) selected[0] = scratch[0].token;
+}
+
+Status LaunchRoundBf16(float* values, std::uint64_t elements, cudaStream_t stream) {
+  const std::uint64_t blocks = (elements + kThreads - 1U) / kThreads;
+  RoundBf16Kernel<<<static_cast<unsigned>(blocks), kThreads, 0, stream>>>(values, elements);
+  const cudaError_t error = cudaGetLastError();
+  return error == cudaSuccess ? Status::Ok() : CudaFailure("launch BF16 rounding", error);
+}
+
+Status LaunchFp8Projection(const std::uint8_t* activation, const float* scale,
+                           const Fp8Binding& binding, float* output, cudaStream_t stream) {
+  return internal::LaunchFp8Sm120DirectProjection(
+      activation, scale, binding.weight, binding.scales, output, binding.rows,
+      binding.contracting, stream);
+}
+
+Status LaunchNvfp4Projection(const std::uint8_t* activation, const std::uint8_t* scales,
+                             const Nvfp4Binding& binding, float* output,
+                             cudaStream_t stream) {
+  return internal::LaunchNvfp4Sm120DirectProjection(
+      activation, scales, binding.packed_weight, binding.scales, output, binding.rows,
+      binding.contracting, binding.input_divisor, binding.weight_divisor, stream);
+}
+
+class InferenceEngine {
+ public:
+  InferenceEngine() = default;
+  InferenceEngine(const InferenceEngine&) = delete;
+  InferenceEngine& operator=(const InferenceEngine&) = delete;
+  ~InferenceEngine() {
+    if (stream_ != nullptr) (void)cudaStreamDestroy(stream_);
+  }
+
+  [[nodiscard]] Status Initialize(const std::filesystem::path& model_directory,
+                                  std::uint64_t max_context) {
+    max_context_ = max_context;
+    cudaDeviceProp properties{};
+    cudaError_t error = cudaGetDeviceProperties(&properties, 0);
+    if (error != cudaSuccess) return CudaFailure("cudaGetDeviceProperties", error);
+    if (properties.major != 12 || properties.minor != 0) {
+      return Error(StatusCode::kUnsupported, "greedy characterization requires SM120");
+    }
+    error = cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking);
+    if (error != cudaSuccess) return CudaFailure("create inference stream", error);
+
+    Status status = model_.Load(model_directory);
+    if (!status.ok()) return status;
+    status = AllocateCache();
+    if (!status.ok()) return status;
+    status = AllocateWorkspace();
+    if (!status.ok()) return status;
+    error = cudaMemsetAsync(cache_.data(), 0, static_cast<std::size_t>(cache_.bytes()), stream_);
+    if (error != cudaSuccess) return CudaFailure("clear KV cache", error);
+    error = cudaStreamSynchronize(stream_);
+    return error == cudaSuccess ? Status::Ok() : CudaFailure("initialize inference", error);
+  }
+
+  [[nodiscard]] Result<std::uint32_t> Forward(std::uint32_t token, std::uint64_t position,
+                                              bool select_token) {
+    if (token >= kVocabulary || position >= max_context_) {
+      return Error(StatusCode::kInvalidArgument, "token or position exceeds inference plan");
+    }
+    float* hidden_a = Pointer<float>(workspace_, offsets_.hidden_a);
+    EmbeddingKernel<<<static_cast<unsigned>((kHidden + kThreads - 1U) / kThreads), kThreads,
+                      0, stream_>>>(model_.embedding(), token, hidden_a);
+    cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) return CudaFailure("launch embedding", error);
+
+    for (const auto& layer : model_.layers()) {
+      Status status = RunLayer(layer, position);
+      if (!status.ok()) return status;
+    }
+    float* normalized = Pointer<float>(workspace_, offsets_.normalized);
+    Status status = internal::LaunchRmsNorm(hidden_a, model_.final_norm(), normalized, 1U,
+                                            kHidden, kEpsilon, stream_);
+    if (!status.ok()) return status;
+    status = LaunchRoundBf16(normalized, kHidden, stream_);
+    if (!status.ok()) return status;
+    if (!select_token) return 0U;
+
+    float* logits = Pointer<float>(workspace_, offsets_.logits);
+    auto* selected = Pointer<std::uint32_t>(workspace_, offsets_.selected);
+    OutputHeadKernel<<<static_cast<unsigned>(kVocabulary), kThreads, 0, stream_>>>(
+        model_.embedding(), normalized, logits);
+    error = cudaGetLastError();
+    if (error != cudaSuccess) return CudaFailure("launch tied output head", error);
+    ArgmaxKernel<<<1U, kThreads, 0, stream_>>>(logits, selected);
+    error = cudaGetLastError();
+    if (error != cudaSuccess) return CudaFailure("launch greedy argmax", error);
+    std::uint32_t host_token = 0;
+    error = cudaMemcpyAsync(&host_token, selected, sizeof(host_token), cudaMemcpyDeviceToHost,
+                            stream_);
+    if (error != cudaSuccess) return CudaFailure("copy selected token", error);
+    error = cudaStreamSynchronize(stream_);
+    if (error != cudaSuccess) return CudaFailure("synchronize selected token", error);
+    return host_token;
+  }
+
+  [[nodiscard]] std::uint64_t weight_bytes() const { return model_.weight_bytes(); }
+  [[nodiscard]] std::uint64_t cache_bytes() const { return cache_.bytes(); }
+  [[nodiscard]] std::uint64_t workspace_bytes() const { return workspace_.bytes(); }
+
+ private:
+  [[nodiscard]] Status AllocateCache() {
+    LayoutBuilder layout;
+    struct CacheOffsets { std::uint64_t key; std::uint64_t value; };
+    std::array<CacheOffsets, kLayers> offsets{};
+    for (std::size_t index = 0; index < kLayers; ++index) {
+      const auto& layer = model_.layers()[index];
+      auto key = layout.Add<float>(max_context_ * layer.kv_elements);
+      auto value = layout.Add<float>(max_context_ * layer.kv_elements);
+      if (!key.ok()) return key.status();
+      if (!value.ok()) return value.status();
+      offsets[index] = {key.value(), value.value()};
+    }
+    auto size = AlignUp(layout.size(), kAlignment);
+    if (!size.ok()) return size.status();
+    Status status = cache_.Allocate(size.value(), "allocate BF16-semantics KV cache");
+    if (!status.ok()) return status;
+    for (std::size_t index = 0; index < kLayers; ++index) {
+      model_.SetLayerCache(index, Pointer<float>(cache_, offsets[index].key),
+                           Pointer<float>(cache_, offsets[index].value));
+    }
+    return Status::Ok();
+  }
+
+  [[nodiscard]] Status AllocateWorkspace() {
+    LayoutBuilder layout;
+#define GEM16GB_ADD(field, type, elements)                 \
+    do {                                                   \
+      auto next = layout.Add<type>(elements);              \
+      if (!next.ok()) return next.status();                 \
+      offsets_.field = next.value();                        \
+    } while (false)
+    GEM16GB_ADD(hidden_a, float, kHidden);
+    GEM16GB_ADD(hidden_b, float, kHidden);
+    GEM16GB_ADD(normalized, float, kHidden);
+    GEM16GB_ADD(fp8_activation, std::uint8_t, kHidden);
+    GEM16GB_ADD(fp8_scale, float, 1U);
+    GEM16GB_ADD(q, float, kQueryHeads * 512U);
+    GEM16GB_ADD(k, float, 8U * 256U);
+    GEM16GB_ADD(v, float, 8U * 256U);
+    GEM16GB_ADD(q_norm, float, kQueryHeads * 512U);
+    GEM16GB_ADD(k_norm, float, 8U * 256U);
+    GEM16GB_ADD(v_norm, float, 8U * 256U);
+    GEM16GB_ADD(scores, float, kQueryHeads * max_context_);
+    GEM16GB_ADD(attention, float, kQueryHeads * 512U);
+    GEM16GB_ADD(o_activation, std::uint8_t, kQueryHeads * 512U);
+    GEM16GB_ADD(o_scale, float, 1U);
+    GEM16GB_ADD(projection, float, kHidden);
+    GEM16GB_ADD(post_norm, float, kHidden);
+    GEM16GB_ADD(mlp_packed, std::uint8_t, kHidden / 2U);
+    GEM16GB_ADD(mlp_scales, std::uint8_t, kHidden / 16U);
+    GEM16GB_ADD(gate, float, kIntermediate);
+    GEM16GB_ADD(up, float, kIntermediate);
+    GEM16GB_ADD(product, float, kIntermediate);
+    GEM16GB_ADD(down_packed, std::uint8_t, kIntermediate / 2U);
+    GEM16GB_ADD(down_scales, std::uint8_t, kIntermediate / 16U);
+    GEM16GB_ADD(logits, float, kVocabulary);
+    GEM16GB_ADD(selected, std::uint32_t, 1U);
+#undef GEM16GB_ADD
+    auto size = AlignUp(layout.size(), kAlignment);
+    if (!size.ok()) return size.status();
+    offsets_.total = size.value();
+    return workspace_.Allocate(size.value(), "allocate inference workspace arena");
+  }
+
+  [[nodiscard]] Status RunLayer(const LayerBinding& layer, std::uint64_t position) {
+    float* hidden_a = Pointer<float>(workspace_, offsets_.hidden_a);
+    float* hidden_b = Pointer<float>(workspace_, offsets_.hidden_b);
+    float* normalized = Pointer<float>(workspace_, offsets_.normalized);
+    auto* fp8_activation = Pointer<std::uint8_t>(workspace_, offsets_.fp8_activation);
+    float* fp8_scale = Pointer<float>(workspace_, offsets_.fp8_scale);
+    float* q = Pointer<float>(workspace_, offsets_.q);
+    float* k = Pointer<float>(workspace_, offsets_.k);
+    float* v = Pointer<float>(workspace_, offsets_.v);
+    float* q_norm = Pointer<float>(workspace_, offsets_.q_norm);
+    float* k_norm = Pointer<float>(workspace_, offsets_.k_norm);
+    float* v_norm = Pointer<float>(workspace_, offsets_.v_norm);
+    float* scores = Pointer<float>(workspace_, offsets_.scores);
+    float* attention = Pointer<float>(workspace_, offsets_.attention);
+    auto* o_activation = Pointer<std::uint8_t>(workspace_, offsets_.o_activation);
+    float* o_scale = Pointer<float>(workspace_, offsets_.o_scale);
+    float* projection = Pointer<float>(workspace_, offsets_.projection);
+    float* post_norm = Pointer<float>(workspace_, offsets_.post_norm);
+
+    Status status = internal::LaunchRmsNorm(hidden_a, layer.input_norm, normalized, 1U,
+                                            kHidden, kEpsilon, stream_);
+    if (!status.ok()) return status;
+    status = LaunchRoundBf16(normalized, kHidden, stream_);
+    if (!status.ok()) return status;
+    status = internal::LaunchFp8ReferenceTokenQuantization(
+        normalized, fp8_activation, fp8_scale, kHidden, stream_);
+    if (!status.ok()) return status;
+    status = LaunchFp8Projection(fp8_activation, fp8_scale, layer.q, q, stream_);
+    if (!status.ok()) return status;
+    status = LaunchFp8Projection(fp8_activation, fp8_scale, layer.k, k, stream_);
+    if (!status.ok()) return status;
+    if (layer.global) {
+      const cudaError_t error = cudaMemcpyAsync(v, k, layer.kv_elements * sizeof(float),
+                                                cudaMemcpyDeviceToDevice, stream_);
+      if (error != cudaSuccess) return CudaFailure("reuse global K projection for V", error);
+    } else {
+      status = LaunchFp8Projection(fp8_activation, fp8_scale, layer.v, v, stream_);
+      if (!status.ok()) return status;
+    }
+    for (const Status next : {
+             LaunchRoundBf16(q, layer.query_elements, stream_),
+             LaunchRoundBf16(k, layer.kv_elements, stream_),
+             LaunchRoundBf16(v, layer.kv_elements, stream_),
+             internal::LaunchRmsNorm(q, layer.q_norm, q_norm, kQueryHeads,
+                                     layer.head_dimension, kEpsilon, stream_),
+             internal::LaunchRmsNorm(k, layer.k_norm, k_norm, layer.kv_heads,
+                                     layer.head_dimension, kEpsilon, stream_),
+             internal::LaunchRmsNorm(v, nullptr, v_norm, layer.kv_heads,
+                                     layer.head_dimension, kEpsilon, stream_),
+             LaunchRoundBf16(q_norm, layer.query_elements, stream_),
+             LaunchRoundBf16(k_norm, layer.kv_elements, stream_),
+             LaunchRoundBf16(v_norm, layer.kv_elements, stream_),
+         }) {
+      if (!next.ok()) return next;
+    }
+    if (layer.global) {
+      status = internal::LaunchProportionalRotaryEmbedding(
+          q_norm, kQueryHeads, layer.head_dimension, 0.25, position, 1000000.0, 1.0, stream_);
+      if (!status.ok()) return status;
+      status = internal::LaunchProportionalRotaryEmbedding(
+          k_norm, layer.kv_heads, layer.head_dimension, 0.25, position, 1000000.0, 1.0,
+          stream_);
+    } else {
+      status = internal::LaunchRotaryEmbedding(q_norm, kQueryHeads, layer.head_dimension,
+                                               layer.head_dimension, position, 10000.0, stream_);
+      if (!status.ok()) return status;
+      status = internal::LaunchRotaryEmbedding(k_norm, layer.kv_heads, layer.head_dimension,
+                                               layer.head_dimension, position, 10000.0, stream_);
+    }
+    if (!status.ok()) return status;
+    status = LaunchRoundBf16(q_norm, layer.query_elements, stream_);
+    if (!status.ok()) return status;
+    status = LaunchRoundBf16(k_norm, layer.kv_elements, stream_);
+    if (!status.ok()) return status;
+    status = internal::LaunchAppendKv(k_norm, v_norm, layer.key_cache, layer.value_cache,
+                                      position, layer.kv_heads, layer.head_dimension, stream_);
+    if (!status.ok()) return status;
+    status = internal::LaunchLocalAttentionDecode(
+        q_norm, layer.key_cache, layer.value_cache, scores, attention, kQueryHeads,
+        layer.kv_heads, layer.head_dimension, position + 1U, stream_);
+    if (!status.ok()) return status;
+    status = LaunchRoundBf16(attention, layer.query_elements, stream_);
+    if (!status.ok()) return status;
+    status = internal::LaunchFp8ReferenceTokenQuantization(
+        attention, o_activation, o_scale, layer.query_elements, stream_);
+    if (!status.ok()) return status;
+    status = LaunchFp8Projection(o_activation, o_scale, layer.o, projection, stream_);
+    if (!status.ok()) return status;
+    status = LaunchRoundBf16(projection, kHidden, stream_);
+    if (!status.ok()) return status;
+    status = internal::LaunchRmsNorm(projection, layer.post_attention_norm, post_norm, 1U,
+                                    kHidden, kEpsilon, stream_);
+    if (!status.ok()) return status;
+    status = LaunchRoundBf16(post_norm, kHidden, stream_);
+    if (!status.ok()) return status;
+    status = internal::LaunchAddResidual(post_norm, hidden_a, hidden_b, kHidden, stream_);
+    if (!status.ok()) return status;
+    status = LaunchRoundBf16(hidden_b, kHidden, stream_);
+    if (!status.ok()) return status;
+
+    auto* mlp_packed = Pointer<std::uint8_t>(workspace_, offsets_.mlp_packed);
+    auto* mlp_scales = Pointer<std::uint8_t>(workspace_, offsets_.mlp_scales);
+    float* gate = Pointer<float>(workspace_, offsets_.gate);
+    float* up = Pointer<float>(workspace_, offsets_.up);
+    float* product = Pointer<float>(workspace_, offsets_.product);
+    auto* down_packed = Pointer<std::uint8_t>(workspace_, offsets_.down_packed);
+    auto* down_scales = Pointer<std::uint8_t>(workspace_, offsets_.down_scales);
+    status = internal::LaunchRmsNorm(hidden_b, layer.pre_mlp_norm, normalized, 1U, kHidden,
+                                    kEpsilon, stream_);
+    if (!status.ok()) return status;
+    status = LaunchRoundBf16(normalized, kHidden, stream_);
+    if (!status.ok()) return status;
+    status = internal::LaunchNvfp4ReferenceActivationQuantization(
+        normalized, mlp_packed, mlp_scales, kHidden, layer.gate.input_divisor, stream_);
+    if (!status.ok()) return status;
+    status = LaunchNvfp4Projection(mlp_packed, mlp_scales, layer.gate, gate, stream_);
+    if (!status.ok()) return status;
+    status = LaunchNvfp4Projection(mlp_packed, mlp_scales, layer.up, up, stream_);
+    if (!status.ok()) return status;
+    status = LaunchRoundBf16(gate, kIntermediate, stream_);
+    if (!status.ok()) return status;
+    status = LaunchRoundBf16(up, kIntermediate, stream_);
+    if (!status.ok()) return status;
+    status = internal::LaunchGeluTanhProduct(gate, up, product, kIntermediate, stream_);
+    if (!status.ok()) return status;
+    status = LaunchRoundBf16(product, kIntermediate, stream_);
+    if (!status.ok()) return status;
+    status = internal::LaunchNvfp4ReferenceActivationQuantization(
+        product, down_packed, down_scales, kIntermediate, layer.down.input_divisor, stream_);
+    if (!status.ok()) return status;
+    status = LaunchNvfp4Projection(down_packed, down_scales, layer.down, projection, stream_);
+    if (!status.ok()) return status;
+    status = LaunchRoundBf16(projection, kHidden, stream_);
+    if (!status.ok()) return status;
+    status = internal::LaunchRmsNorm(projection, layer.post_mlp_norm, post_norm, 1U, kHidden,
+                                    kEpsilon, stream_);
+    if (!status.ok()) return status;
+    status = LaunchRoundBf16(post_norm, kHidden, stream_);
+    if (!status.ok()) return status;
+    status = internal::LaunchAddResidual(post_norm, hidden_b, hidden_a, kHidden, stream_);
+    if (!status.ok()) return status;
+    status = LaunchRoundBf16(hidden_a, kHidden, stream_);
+    if (!status.ok()) return status;
+    status = internal::LaunchScale(hidden_a, layer.layer_scalar, kHidden, stream_);
+    if (!status.ok()) return status;
+    return LaunchRoundBf16(hidden_a, kHidden, stream_);
+  }
+
+  LoadedModel model_;
+  DeviceAllocation cache_;
+  DeviceAllocation workspace_;
+  WorkspaceOffsets offsets_{};
+  cudaStream_t stream_ = nullptr;
+  std::uint64_t max_context_ = 0;
+};
+
+double Milliseconds(std::chrono::steady_clock::duration duration) {
+  return std::chrono::duration<double, std::milli>(duration).count();
+}
+
+}  // namespace
+
+Result<GreedyInferenceResult> RunGreedyInference(const GreedyInferenceOptions& options) {
+  if (options.model_directory.empty()) {
+    return Error(StatusCode::kInvalidArgument, "greedy inference requires --model");
+  }
+  if (options.input_token_ids.empty()) {
+    return Error(StatusCode::kInvalidArgument, "greedy inference requires input token IDs");
+  }
+  if (options.max_generated_tokens == 0U) {
+    return Error(StatusCode::kInvalidArgument, "--max-tokens must be positive");
+  }
+  if (options.max_context_tokens == 0U || options.max_context_tokens > kSlidingWindow) {
+    return Error(StatusCode::kUnsupported,
+                 "the initial contiguous correctness cache supports 1..1024 tokens");
+  }
+  if (options.input_token_ids.size() > options.max_context_tokens ||
+      options.max_generated_tokens - 1U >
+          options.max_context_tokens - options.input_token_ids.size()) {
+    return Error(StatusCode::kInvalidArgument,
+                 "prompt plus generated decode positions exceed --max-context");
+  }
+  for (const std::uint32_t token : options.input_token_ids) {
+    if (token >= kVocabulary) {
+      return Error(StatusCode::kInvalidArgument, "input token ID exceeds vocabulary");
+    }
+  }
+
+  const auto load_start = std::chrono::steady_clock::now();
+  InferenceEngine engine;
+  Status status = engine.Initialize(options.model_directory, options.max_context_tokens);
+  if (!status.ok()) return status;
+  const auto load_end = std::chrono::steady_clock::now();
+
+  GreedyInferenceResult result;
+  result.output_token_ids.reserve(static_cast<std::size_t>(options.max_generated_tokens));
+  result.model_load_milliseconds = Milliseconds(load_end - load_start);
+  result.weight_arena_bytes = engine.weight_bytes();
+  result.kv_cache_bytes = engine.cache_bytes();
+  result.workspace_bytes = engine.workspace_bytes();
+  result.source_layout_direct = true;
+  result.token_loop_allocations = false;
+  result.benchmark_qualified = false;
+
+  const auto prompt_start = std::chrono::steady_clock::now();
+  std::uint32_t next_token = 0;
+  for (std::size_t index = 0; index < options.input_token_ids.size(); ++index) {
+    const bool select = index + 1U == options.input_token_ids.size();
+    auto forwarded = engine.Forward(options.input_token_ids[index], index, select);
+    if (!forwarded.ok()) return forwarded.status();
+    if (select) next_token = forwarded.value();
+  }
+  const auto prompt_end = std::chrono::steady_clock::now();
+  result.prompt_milliseconds = Milliseconds(prompt_end - prompt_start);
+  result.output_token_ids.push_back(next_token);
+
+  const auto decode_start = std::chrono::steady_clock::now();
+  for (std::uint64_t generated = 1U; generated < options.max_generated_tokens; ++generated) {
+    const std::uint64_t position = options.input_token_ids.size() + generated - 1U;
+    auto forwarded = engine.Forward(next_token, position, true);
+    if (!forwarded.ok()) return forwarded.status();
+    next_token = forwarded.value();
+    result.output_token_ids.push_back(next_token);
+  }
+  const auto decode_end = std::chrono::steady_clock::now();
+  result.decode_milliseconds = Milliseconds(decode_end - decode_start);
+  const std::uint64_t measured_decode_tokens = options.max_generated_tokens - 1U;
+  if (measured_decode_tokens != 0U && result.decode_milliseconds > 0.0) {
+    result.decode_tokens_per_second =
+        static_cast<double>(measured_decode_tokens) * 1000.0 / result.decode_milliseconds;
+  }
+  return result;
+}
+
+Status WriteGreedyInferenceJson(const GreedyInferenceResult& result, std::ostream& output) {
+  output << "{\n  \"schema_version\": 1,\n"
+         << "  \"status\": \"characterization\",\n"
+         << "  \"benchmark_qualified\": false,\n"
+         << "  \"precision\": \"bf16_state_fp8_attention_nvfp4_mlp\",\n"
+         << "  \"fallbacks\": " << result.fallback_count << ",\n"
+         << "  \"source_layout_direct\": "
+         << (result.source_layout_direct ? "true" : "false") << ",\n"
+         << "  \"token_loop_allocations\": "
+         << (result.token_loop_allocations ? "true" : "false") << ",\n"
+         << "  \"model_load_ms\": " << result.model_load_milliseconds << ",\n"
+         << "  \"prompt_ms\": " << result.prompt_milliseconds << ",\n"
+         << "  \"decode_ms\": " << result.decode_milliseconds << ",\n"
+         << "  \"decode_tokens_per_second\": " << result.decode_tokens_per_second << ",\n"
+         << "  \"weight_arena_bytes\": " << result.weight_arena_bytes << ",\n"
+         << "  \"kv_cache_bytes\": " << result.kv_cache_bytes << ",\n"
+         << "  \"workspace_bytes\": " << result.workspace_bytes << ",\n"
+         << "  \"output_token_ids\": [";
+  for (std::size_t index = 0; index < result.output_token_ids.size(); ++index) {
+    if (index != 0U) output << ',';
+    output << result.output_token_ids[index];
+  }
+  output << "]\n}\n";
+  return output.good() ? Status::Ok()
+                       : Error(StatusCode::kIoError, "failed to write inference JSON");
+}
+
+}  // namespace gem16gb

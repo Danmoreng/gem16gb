@@ -64,6 +64,7 @@ if(GEM16GB_ENABLE_CUDA)
   gem16gb_configure_cuda_architectures()
   target_sources(gem16gb_core PRIVATE
     src/cuda/dispatch.cu
+    src/cuda/inference.cu
     src/cuda/fp8/checkpoint_probe.cu
     src/cuda/fp8/reference.cu
     src/cuda/fp8/sm120.cu
@@ -125,6 +126,7 @@ if(GEM16GB_ENABLE_CUDA)
   )
   message(STATUS "gem16gb CUDA capability scaffold: enabled for ${CMAKE_CUDA_ARCHITECTURES}")
 else()
+  target_sources(gem16gb_core PRIVATE src/runtime/inference_stub.cpp)
   target_compile_definitions(gem16gb_core PUBLIC GEM16GB_HAS_CUDA=0)
   message(STATUS "gem16gb CUDA capability scaffold: disabled")
 endif()

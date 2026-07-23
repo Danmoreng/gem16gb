@@ -1,6 +1,6 @@
 # Roadmap
 
-Current stage: Milestone 3, native layer assembly.
+Current stage: Milestone 3, first full-model greedy characterization.
 
 Linux and Windows host/CUDA build scaffolding is now available. This makes loader development and validation on the
 same Blackwell machine possible from either operating system; it does not move Windows production inference ahead
@@ -8,6 +8,14 @@ of the correctness and native-kernel gates below.
 
 ## Active gate
 
+- The first arena-backed 48-layer decode characterization loads all text-only tensors once, uses fixed
+  BF16-semantics K/V and workspace arenas, executes the tied output head and GPU argmax, and reproduces the two
+  committed greedy tokens for `exact_blue_no_thinking`. Extend this from token agreement to full-vocabulary logits,
+  prompt-derived layer states, 32 decode steps, and the required 512-token stability gate before qualification.
+- Replace token-at-a-time prompt ingestion with a separate native prefill plan. The current prompt timing is a
+  correctness bridge and must not be reported as prompt throughput.
+- Replace the initial contiguous cache, currently capped at 1,024 total positions, with circular local storage and
+  independently growing global storage, then qualify FP8 cache semantics.
 - Extend the now-committed trusted vLLM token/top-logprob fixture with full-vocabulary logits and selected hidden
   states.
 - Finish the quality and native-dispatch gates for the patched same-source closest-parity GGUF, then select and lock
@@ -44,7 +52,7 @@ The llama.cpp benchmark is deliberately before engine kernel optimization, but a
 ## Next milestones
 
 1. Accept or reject the patched closest-parity characterization, then establish viable llama.cpp tiers B and C.
-2. Capture full-vocabulary reference logits and selected hidden states.
+2. Capture full-vocabulary reference logits and selected hidden states, then add an engine logit-dump comparison.
 3. ~~Implement the exact host NVFP4 codec and projection oracle, including real-checkpoint byte-pattern fixtures.~~
 4. ~~Implement an explicit correctness-only CUDA W4A4 route that consumes packed E2M1 values and E4M3 scales.~~
 5. ~~Implement and round-trip-test direct SM120 fragment views over source weight/scale storage for Gate, Up, and
@@ -68,8 +76,9 @@ The llama.cpp benchmark is deliberately before engine kernel optimization, but a
    Layer-0 attention and MLP sublayers are now connected without a host roundtrip. Next replace the deterministic
    hidden/cache inputs with a trusted prompt-derived Layer-0 fixture. Follow ninfer's useful split-output planning
    pattern for combined projections while retaining this checkpoint's E4M3/BF16 scale contract.
-10. Complete execution-workspace planning and add specialized attention, KV cache, decode fusion, and CUDA Graph
-   replay only after the unfused model passes layer, logit, and generation gates.
+10. The first fixed-address execution workspace and full-model BF16-semantics cache are implemented for contexts up
+   to 1,024. Complete production workspace planning and add circular/FP8 cache, decode fusion, and CUDA Graph replay
+   only after the unfused model passes layer, logit, and generation gates.
 11. Validate 64K, then 128K context. MTP and multimodal work remain later milestones.
 12. After the Blackwell backend is correct and competitive, add architecture-specific backends for additional 16 GB
    CUDA GPUs without weakening benchmark or memory contracts.

@@ -20,9 +20,14 @@ approximately 16 GB of VRAM. The first model is the mixed FP8/NVFP4
   projection. A complete real-checkpoint Layer-0 characterization now composes FP8 local attention and the NVFP4
   MLP without a host roundtrip or persistent weight repack. It is a correctness characterization, not yet a
   trusted-hidden-state or performance qualification.
+- A CUDA-only, batch-one greedy characterization now loads the complete text model into one weight arena, executes
+  all 48 layers with separate K/V caches, applies the tied BF16 output head and exact logit softcap, and selects the
+  token on the GPU. The pinned 20-token prompt reproduces both committed greedy tokens exactly with zero fallbacks
+  and no allocation in the token loop.
 
-Inference and benchmarks do **not** work yet. `gem16gb-run` and `gem16gb-bench` fail visibly and never fall back to a
-higher precision path.
+Text tokenization, optimized prefill, contexts beyond the initial contiguous 1,024-token cache, sampling, CUDA
+Graphs, and benchmark-qualified inference do **not** work yet. Unsupported modes fail visibly and never fall back
+to a higher precision path.
 
 ## Build on Linux
 
@@ -42,6 +47,28 @@ build/Linux/blackwell-release/bin/gem16gb-run --print-kernel-capabilities
 The CUDA build targets only `120a`. Its experimental projection disassembles to
 `OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X`, but the capability report deliberately remains
 `native_nvfp4_kernels=false` until real-shape, layer, logit, and benchmark gates pass.
+
+## Greedy inference characterization
+
+The first end-to-end path accepts token IDs so tokenizer behavior cannot hide model errors. It is deliberately
+reported as `status=characterization` and `benchmark_qualified=false`:
+
+```bash
+build/Linux/blackwell-release/bin/gem16gb-run \
+  --model models/checkpoints/unsloth-gemma-4-12b-it-NVFP4-b1f6497 \
+  --input-token-ids 2,105,2364,107,40654,607,7121,506,3658,3730,236761,106,107,105,4368,107,100,45518,107,101 \
+  --max-tokens 2 \
+  --max-context 32 \
+  --greedy
+```
+
+Reproduce the committed-token gate without copying token IDs manually:
+
+```bash
+python3 tools/validate_inference.py \
+  --run build/Linux/blackwell-release/bin/gem16gb-run \
+  --model models/checkpoints/unsloth-gemma-4-12b-it-NVFP4-b1f6497
+```
 
 ## Build on Windows
 
