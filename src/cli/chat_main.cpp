@@ -1,0 +1,265 @@
+#include <algorithm>
+#include <charconv>
+#include <cstdint>
+#include <filesystem>
+#include <iostream>
+#include <limits>
+#include <span>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include "gem16gb/engine.h"
+#include "gem16gb/tokenizer.h"
+
+namespace {
+
+bool ParseUnsigned(std::string_view text, std::uint64_t& value) {
+  const auto result =
+      std::from_chars(text.data(), text.data() + text.size(), value);
+  return result.ec == std::errc{} && result.ptr == text.data() + text.size();
+}
+
+std::string JsonEscape(std::string_view value) {
+  std::string result;
+  result.reserve(value.size() + 2U);
+  result.push_back('"');
+  constexpr char kHex[] = "0123456789abcdef";
+  for (const unsigned char byte : value) {
+    switch (byte) {
+      case '"': result.append("\\\""); break;
+      case '\\': result.append("\\\\"); break;
+      case '\b': result.append("\\b"); break;
+      case '\f': result.append("\\f"); break;
+      case '\n': result.append("\\n"); break;
+      case '\r': result.append("\\r"); break;
+      case '\t': result.append("\\t"); break;
+      default:
+        if (byte < 0x20U) {
+          result.append("\\u00");
+          result.push_back(kHex[byte >> 4U]);
+          result.push_back(kHex[byte & 0x0FU]);
+        } else {
+          result.push_back(static_cast<char>(byte));
+        }
+    }
+  }
+  result.push_back('"');
+  return result;
+}
+
+void WriteTokenIds(std::span<const std::uint32_t> token_ids) {
+  std::cout << '[';
+  for (std::size_t index = 0; index < token_ids.size(); ++index) {
+    if (index != 0U) std::cout << ',';
+    std::cout << token_ids[index];
+  }
+  std::cout << ']';
+}
+
+void PrintUsage() {
+  std::cout
+      << "Usage:\n"
+      << "  gem16gb-chat --model <checkpoint> [--max-tokens N] [--max-context N]\n"
+      << "                [--thinking] [--system <text>]\n"
+      << "  gem16gb-chat --model <checkpoint> --message <text> [--json]\n"
+      << "  gem16gb-chat --model <checkpoint> --message <text> --render-only --json\n";
+}
+
+struct Options {
+  std::filesystem::path model_directory;
+  std::string system_message;
+  std::string one_shot_message;
+  std::uint64_t max_tokens = 128;
+  std::uint64_t max_context = 1024;
+  bool has_system_message = false;
+  bool has_one_shot_message = false;
+  bool thinking = false;
+  bool render_only = false;
+  bool json = false;
+};
+
+gem16gb::Result<Options> ParseOptions(int argc, char** argv) {
+  Options options;
+  for (int index = 1; index < argc; ++index) {
+    const std::string_view argument(argv[index]);
+    if (argument == "--model" && index + 1 < argc) {
+      options.model_directory = argv[++index];
+    } else if (argument == "--system" && index + 1 < argc) {
+      options.system_message = argv[++index];
+      options.has_system_message = true;
+    } else if (argument == "--message" && index + 1 < argc) {
+      options.one_shot_message = argv[++index];
+      options.has_one_shot_message = true;
+    } else if (argument == "--max-tokens" && index + 1 < argc) {
+      if (!ParseUnsigned(argv[++index], options.max_tokens)) {
+        return gem16gb::Status(gem16gb::StatusCode::kInvalidArgument,
+                              "--max-tokens must be an unsigned integer");
+      }
+    } else if (argument == "--max-context" && index + 1 < argc) {
+      if (!ParseUnsigned(argv[++index], options.max_context)) {
+        return gem16gb::Status(gem16gb::StatusCode::kInvalidArgument,
+                              "--max-context must be an unsigned integer");
+      }
+    } else if (argument == "--thinking") {
+      options.thinking = true;
+    } else if (argument == "--render-only") {
+      options.render_only = true;
+    } else if (argument == "--json") {
+      options.json = true;
+    } else {
+      return gem16gb::Status(gem16gb::StatusCode::kInvalidArgument,
+                            "unknown or incomplete option: " +
+                                std::string(argument));
+    }
+  }
+  if (options.model_directory.empty()) {
+    return gem16gb::Status(gem16gb::StatusCode::kInvalidArgument,
+                          "--model is required");
+  }
+  if ((options.render_only || options.json) &&
+      !options.has_one_shot_message) {
+    return gem16gb::Status(
+        gem16gb::StatusCode::kInvalidArgument,
+        "--render-only and --json require a one-shot --message");
+  }
+  if (options.max_tokens == 0U || options.max_context == 0U) {
+    return gem16gb::Status(gem16gb::StatusCode::kInvalidArgument,
+                          "token and context limits must be positive");
+  }
+  return options;
+}
+
+struct TurnOutput {
+  std::string content;
+  std::string display_text;
+};
+
+gem16gb::Result<TurnOutput> RunTurn(
+    const Options& cli, const gem16gb::GemmaChatProcessor& processor,
+    std::vector<gem16gb::ChatMessage>& messages, bool write_json) {
+  auto rendered = processor.Render(messages, cli.thinking);
+  if (!rendered.ok()) return rendered.status();
+  auto prompt_ids = processor.Encode(messages, cli.thinking);
+  if (!prompt_ids.ok()) return prompt_ids.status();
+
+  if (cli.render_only) {
+    if (write_json) {
+      std::cout << "{\"rendered_prompt\":" << JsonEscape(rendered.value())
+                << ",\"prompt_token_ids\":";
+      WriteTokenIds(prompt_ids.value());
+      std::cout << "}\n";
+    } else {
+      std::cout << rendered.value() << '\n';
+    }
+    return TurnOutput{};
+  }
+
+  gem16gb::GreedyInferenceOptions inference_options;
+  inference_options.model_directory = cli.model_directory;
+  inference_options.input_token_ids = std::move(prompt_ids).value();
+  inference_options.stop_token_ids =
+      processor.generation_controls().stop_token_ids;
+  inference_options.suppressed_token_ids =
+      processor.generation_controls().suppressed_token_ids;
+  inference_options.max_generated_tokens = cli.max_tokens;
+  inference_options.max_context_tokens = cli.max_context;
+  auto inference = gem16gb::RunGreedyInference(inference_options);
+  if (!inference.ok()) return inference.status();
+
+  std::vector<std::uint32_t> content_ids =
+      inference.value().output_token_ids;
+  if (!content_ids.empty() &&
+      std::find(processor.generation_controls().stop_token_ids.begin(),
+                processor.generation_controls().stop_token_ids.end(),
+                content_ids.back()) !=
+          processor.generation_controls().stop_token_ids.end()) {
+    content_ids.pop_back();
+  }
+  auto assistant_content = processor.Decode(content_ids, false);
+  if (!assistant_content.ok()) return assistant_content.status();
+  auto assistant_text = processor.Decode(content_ids, true);
+  if (!assistant_text.ok()) return assistant_text.status();
+
+  if (write_json) {
+    std::cout << "{\"assistant_content\":"
+              << JsonEscape(assistant_content.value())
+              << ",\"assistant_text\":" << JsonEscape(assistant_text.value())
+              << ",\"prompt_token_ids\":";
+    WriteTokenIds(inference_options.input_token_ids);
+    std::cout << ",\"output_token_ids\":";
+    WriteTokenIds(inference.value().output_token_ids);
+    std::cout << ",\"finish_reason\":"
+              << JsonEscape(inference.value().stopped ? "stop" : "length")
+              << ",\"benchmark_qualified\":false}\n";
+  }
+  return TurnOutput{std::move(assistant_content).value(),
+                    std::move(assistant_text).value()};
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  if (argc == 2 &&
+      (std::string_view(argv[1]) == "--help" ||
+       std::string_view(argv[1]) == "-h")) {
+    PrintUsage();
+    return 0;
+  }
+  auto parsed = ParseOptions(argc, argv);
+  if (!parsed.ok()) {
+    std::cerr << "error: " << parsed.status().message() << '\n';
+    PrintUsage();
+    return 64;
+  }
+  const Options options = std::move(parsed).value();
+  auto processor =
+      gem16gb::GemmaChatProcessor::Load(options.model_directory);
+  if (!processor.ok()) {
+    std::cerr << "error: " << processor.status().message() << '\n';
+    return 2;
+  }
+
+  std::vector<gem16gb::ChatMessage> messages;
+  if (options.has_system_message) {
+    messages.push_back({"system", options.system_message});
+  }
+  if (options.has_one_shot_message) {
+    messages.push_back({"user", options.one_shot_message});
+    auto response =
+        RunTurn(options, processor.value(), messages, options.json);
+    if (!response.ok()) {
+      std::cerr << "error: " << response.status().message() << '\n';
+      return 2;
+    }
+    if (!options.json && !options.render_only) {
+      std::cout << response.value().display_text << '\n';
+    }
+    return 0;
+  }
+
+  std::cout << "gem16gb native chat characterization (/quit to exit)\n"
+            << "The current engine reloads the model and reprocesses history for each turn.\n";
+  while (true) {
+    std::cout << "you> " << std::flush;
+    std::string input;
+    if (!std::getline(std::cin, input)) {
+      std::cout << '\n';
+      break;
+    }
+    if (input == "/quit" || input == "/exit") break;
+    if (input.empty()) continue;
+    messages.push_back({"user", input});
+    auto response =
+        RunTurn(options, processor.value(), messages, false);
+    if (!response.ok()) {
+      messages.pop_back();
+      std::cerr << "error: " << response.status().message() << '\n';
+      continue;
+    }
+    std::cout << "model> " << response.value().display_text << '\n';
+    messages.push_back(
+        {"assistant", std::move(response).value().content});
+  }
+  return 0;
+}

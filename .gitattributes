@@ -10,6 +10,7 @@ CMakePresets.json text eol=lf
 *.cu text eol=lf
 *.h text eol=lf
 *.json text eol=lf
+*.jinja text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
 *.md text eol=lf

@@ -23,11 +23,15 @@ approximately 16 GB of VRAM. The first model is the mixed FP8/NVFP4
 - A CUDA-only, batch-one greedy characterization now loads the complete text model into one weight arena, executes
   all 48 layers with separate K/V caches, applies the tied BF16 output head and exact logit softcap, and selects the
   token on the GPU. The pinned 20-token prompt reproduces both committed greedy tokens exactly with zero fallbacks
-  and no allocation in the token loop.
+  and no allocation in the token loop. Checkpoint EOS and suppressed-token controls are applied explicitly.
+- `gem16gb-chat` is a pure C++ application. It loads the checkpoint's `tokenizer.json`, performs native
+  byte-fallback BPE encode/decode, enforces the pinned `chat_template.jinja` contract, and sources EOS/suppressed
+  tokens from `generation_config.json`.
 
-Text tokenization, optimized prefill, contexts beyond the initial contiguous 1,024-token cache, sampling, CUDA
-Graphs, and benchmark-qualified inference do **not** work yet. Unsupported modes fail visibly and never fall back
-to a higher precision path.
+Optimized prefill, contexts beyond the initial contiguous 1,024-token cache, sampling, CUDA Graphs, persistent chat
+sessions, and benchmark-qualified inference do **not** work yet. A longer committed reference chat diverges at its
+third generated token, so the CLI is useful for development conversations but the early distribution difference
+remains under investigation. Unsupported modes fail visibly and never fall back to a higher precision path.
 
 ## Build on Linux
 
@@ -69,6 +73,28 @@ python3 tools/validate_inference.py \
   --run build/Linux/blackwell-release/bin/gem16gb-run \
   --model models/checkpoints/unsloth-gemma-4-12b-it-NVFP4-b1f6497
 ```
+
+## Command-line chat characterization
+
+Run the native C++ application directly:
+
+```bash
+build/Linux/blackwell-release/bin/gem16gb-chat \
+  --model models/checkpoints/unsloth-gemma-4-12b-it-NVFP4-b1f6497
+```
+
+Enter `/quit` to exit. Add `--thinking` to enable the checkpoint template's thinking form. The current
+characterization reloads the model and reprocesses the full conversation on every turn; persistent sessions follow
+after the model-wide correctness gate. For an auditable one-turn result:
+
+```bash
+build/Linux/blackwell-release/bin/gem16gb-chat \
+  --model models/checkpoints/unsloth-gemma-4-12b-it-NVFP4-b1f6497 \
+  --message "Reply with exactly the word blue." --max-tokens 8 --max-context 64 --json
+```
+
+`--render-only --json` validates prompt rendering and token IDs without loading CUDA weights. No Python interpreter,
+Transformers installation, server, or subprocess is involved in the chat application.
 
 ## Build on Windows
 

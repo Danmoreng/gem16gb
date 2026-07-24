@@ -30,9 +30,20 @@ tied BF16 embedding/output matrix, exact logit softcap, and GPU argmax, and perf
 not yet graph-captured or benchmark-qualified.
 
 The first full-model path intentionally accepts token IDs and limits the contiguous correctness cache to 1,024
-positions. Prompt tokens pass through the one-token decode plan as a temporary correctness bridge. A separate
-parallel prefill graph, circular local cache, growing global cache, FP8 cache storage, tokenizer, and sampling plans
-remain required production components.
+positions. Prompt tokens pass through the one-token decode plan as a temporary correctness bridge. The pure C++
+`GemmaChatProcessor` loads the checkpoint vocabulary, merge ranks, byte fallback, generation controls, and exact
+pinned Jinja artifact. It implements the supported text-only behavior of that template natively and rejects a
+different template revision rather than silently approximating it. This makes real chat flows testable now while
+preserving a narrow execution contract. A separate parallel prefill graph, circular local cache, growing global
+cache, FP8 cache storage, and sampling plans remain required production components.
+
+The reusable `ChatMessage`, `Tokenizer`, and `GemmaChatProcessor` interfaces are deliberately independent of
+terminal I/O. A future OpenAI-compatible Chat Completions server can reuse this request-to-token boundary; HTTP,
+JSON request schemas, streaming, and session scheduling are not part of the current CLI milestone.
+
+The greedy plan copies checkpoint `suppress_tokens` into fixed workspace before prompt processing and stops on any
+checkpoint EOS token. Optional full-logit capture preallocates host storage before the token loop and writes raw
+little-endian float32 only after generation; it is a correctness diagnostic and invalidates timing comparisons.
 
 ## NVFP4 execution boundary
 

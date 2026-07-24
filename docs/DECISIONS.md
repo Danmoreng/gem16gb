@@ -1,5 +1,40 @@
 # Decisions
 
+## 2026-07-24: Expose checkpoint chat semantics through a native C++ boundary
+
+Date: 2026-07-24
+Decision: Implement checkpoint byte-fallback BPE, text chat rendering, decoding, and generation controls in C++.
+Read and identity-check the actual `chat_template.jinja`, implement its supported text branches natively, and reject
+unknown revisions or unsupported roles. Keep the processor independent of terminal I/O for later Chat Completions
+reuse.
+Context: The user-facing chat executable must not depend on Python or Transformers. A generic Jinja runtime would
+add a broad dependency and still require careful model-specific semantics, while silently hard-coding a template
+without reading the artifact would violate the checkpoint contract.
+Alternatives: Retain the Python bridge; embed Python; vendor a general Jinja interpreter; accept only manual token
+IDs.
+Consequences: `gem16gb-chat` is a self-contained C++ process and the tokenizer/processor can later serve HTTP
+requests. The supported template revision is explicit. Tool-call and multimodal branches remain unsupported until
+implemented and tested. The engine still reloads weights per turn until a persistent session API is introduced.
+Evidence: Native C++ rendering and BPE reproduce the committed 20-, 23-, and 27-token prompts exactly, and the
+CUDA one-shot path produces and decodes `[9503, 106]` as `blue`.
+
+## 2026-07-24: Use cross-engine distributions and quality, not bit identity
+
+Date: 2026-07-24
+Decision: Do not require generated tokens or logits to be bit-identical to vLLM or llama.cpp. Require unexplained
+large or early deviations to be investigated with full logits, hidden states, quality tasks, and independent
+references before setting measured tolerances.
+Context: vLLM consumes the mixed FP8/NVFP4 source directly, while the closest-parity llama.cpp candidate maps FP8
+attention to BF16 and uses different kernels. They nevertheless agree for most current tokens but eventually
+diverge, as expected from autoregressive sensitivity.
+Alternatives: Require exact token equality indefinitely; accept any coherent-looking text; select one runtime as
+infallible.
+Consequences: Product correctness is based on operator contracts, distribution metrics, generation stability, and
+task quality. Our sky-prompt divergence at step 2 remains blocking evidence because both references select the same
+alternative with a meaningful margin; no tolerance is invented merely to accept it.
+Evidence: llama.cpp matches 50/65 current reference tokens, including 18 initial sky tokens and 28/32 thinking
+tokens. At engine sky step 2, both references choose `563`, while the engine promotes their rank-2 `7412`.
+
 ## 2026-07-23: Qualify unfused full-layer composition before fusion
 
 Date: 2026-07-23

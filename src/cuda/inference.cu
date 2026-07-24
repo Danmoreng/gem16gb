@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <ostream>
 #include <string>
@@ -39,6 +40,7 @@ constexpr std::uint64_t kQueryHeads = 16;
 constexpr std::uint64_t kLayers = 48;
 constexpr std::uint64_t kSlidingWindow = 1024;
 constexpr std::uint64_t kAlignment = 256;
+constexpr std::uint64_t kMaximumSuppressedTokens = 16;
 constexpr float kEpsilon = 1.0e-6F;
 constexpr unsigned kThreads = 256;
 
@@ -88,6 +90,36 @@ class DeviceAllocation {
  private:
   void* data_ = nullptr;
   std::uint64_t bytes_ = 0;
+};
+
+class PinnedHostAllocation {
+ public:
+  PinnedHostAllocation() = default;
+  PinnedHostAllocation(const PinnedHostAllocation&) = delete;
+  PinnedHostAllocation& operator=(const PinnedHostAllocation&) = delete;
+  ~PinnedHostAllocation() {
+    if (data_ != nullptr) (void)cudaFreeHost(data_);
+  }
+
+  [[nodiscard]] Status Allocate(std::size_t elements) {
+    if (data_ != nullptr || elements == 0U ||
+        elements > std::numeric_limits<std::size_t>::max() / sizeof(float)) {
+      return Error(StatusCode::kInvalidArgument, "pinned full-logit capture size is invalid");
+    }
+    const cudaError_t error =
+        cudaHostAlloc(&data_, elements * sizeof(float), cudaHostAllocDefault);
+    if (error != cudaSuccess) return CudaFailure("allocate pinned full-logit capture", error);
+    elements_ = elements;
+    return Status::Ok();
+  }
+
+  [[nodiscard]] std::span<float> span() const {
+    return {static_cast<float*>(data_), elements_};
+  }
+
+ private:
+  void* data_ = nullptr;
+  std::size_t elements_ = 0;
 };
 
 struct DeviceTensor {
@@ -384,6 +416,7 @@ struct WorkspaceOffsets {
   std::uint64_t down_scales = 0;
   std::uint64_t logits = 0;
   std::uint64_t selected = 0;
+  std::uint64_t suppressed = 0;
   std::uint64_t total = 0;
 };
 
@@ -454,10 +487,20 @@ struct ArgmaxValue {
   std::uint32_t token;
 };
 
-__global__ void ArgmaxKernel(const float* logits, std::uint32_t* selected) {
+__global__ void ArgmaxKernel(const float* logits, const std::uint32_t* suppressed,
+                             std::uint32_t suppressed_count, std::uint32_t* selected) {
   __shared__ ArgmaxValue scratch[kThreads];
   ArgmaxValue best{-FLT_MAX, 0U};
   for (std::uint64_t index = threadIdx.x; index < kVocabulary; index += blockDim.x) {
+    bool skip = false;
+    for (std::uint32_t suppressed_index = 0; suppressed_index < suppressed_count;
+         ++suppressed_index) {
+      if (index == suppressed[suppressed_index]) {
+        skip = true;
+        break;
+      }
+    }
+    if (skip) continue;
     const float value = logits[index];
     if (value > best.value || (value == best.value && index < best.token)) {
       best = {value, static_cast<std::uint32_t>(index)};
@@ -534,8 +577,9 @@ class InferenceEngine {
     return error == cudaSuccess ? Status::Ok() : CudaFailure("initialize inference", error);
   }
 
-  [[nodiscard]] Result<std::uint32_t> Forward(std::uint32_t token, std::uint64_t position,
-                                              bool select_token) {
+  [[nodiscard]] Result<std::uint32_t> Forward(
+      std::uint32_t token, std::uint64_t position, bool select_token,
+      std::span<float> host_logits = {}) {
     if (token >= kVocabulary || position >= max_context_) {
       return Error(StatusCode::kInvalidArgument, "token or position exceeds inference plan");
     }
@@ -563,7 +607,17 @@ class InferenceEngine {
         model_.embedding(), normalized, logits);
     error = cudaGetLastError();
     if (error != cudaSuccess) return CudaFailure("launch tied output head", error);
-    ArgmaxKernel<<<1U, kThreads, 0, stream_>>>(logits, selected);
+    if (!host_logits.empty()) {
+      if (host_logits.size() != kVocabulary) {
+        return Error(StatusCode::kInternal, "host logit capture span has invalid size");
+      }
+      error = cudaMemcpyAsync(host_logits.data(), logits, host_logits.size_bytes(),
+                              cudaMemcpyDeviceToHost, stream_);
+      if (error != cudaSuccess) return CudaFailure("copy full logits", error);
+    }
+    ArgmaxKernel<<<1U, kThreads, 0, stream_>>>(
+        logits, Pointer<std::uint32_t>(workspace_, offsets_.suppressed),
+        suppressed_token_count_, selected);
     error = cudaGetLastError();
     if (error != cudaSuccess) return CudaFailure("launch greedy argmax", error);
     std::uint32_t host_token = 0;
@@ -578,6 +632,22 @@ class InferenceEngine {
   [[nodiscard]] std::uint64_t weight_bytes() const { return model_.weight_bytes(); }
   [[nodiscard]] std::uint64_t cache_bytes() const { return cache_.bytes(); }
   [[nodiscard]] std::uint64_t workspace_bytes() const { return workspace_.bytes(); }
+
+  [[nodiscard]] Status SetSuppressedTokens(std::span<const std::uint32_t> tokens) {
+    if (tokens.size() > kMaximumSuppressedTokens) {
+      return Error(StatusCode::kUnsupported,
+                   "the initial greedy path supports at most 16 suppressed tokens");
+    }
+    suppressed_token_count_ = static_cast<std::uint32_t>(tokens.size());
+    if (tokens.empty()) return Status::Ok();
+    const cudaError_t error = cudaMemcpyAsync(
+        Pointer<std::uint32_t>(workspace_, offsets_.suppressed), tokens.data(),
+        tokens.size_bytes(), cudaMemcpyHostToDevice, stream_);
+    if (error != cudaSuccess) return CudaFailure("copy suppressed token IDs", error);
+    const cudaError_t sync_error = cudaStreamSynchronize(stream_);
+    return sync_error == cudaSuccess ? Status::Ok()
+                                    : CudaFailure("configure suppressed token IDs", sync_error);
+  }
 
  private:
   [[nodiscard]] Status AllocateCache() {
@@ -637,6 +707,7 @@ class InferenceEngine {
     GEM16GB_ADD(down_scales, std::uint8_t, kIntermediate / 16U);
     GEM16GB_ADD(logits, float, kVocabulary);
     GEM16GB_ADD(selected, std::uint32_t, 1U);
+    GEM16GB_ADD(suppressed, std::uint32_t, kMaximumSuppressedTokens);
 #undef GEM16GB_ADD
     auto size = AlignUp(layout.size(), kAlignment);
     if (!size.ok()) return size.status();
@@ -798,6 +869,7 @@ class InferenceEngine {
   WorkspaceOffsets offsets_{};
   cudaStream_t stream_ = nullptr;
   std::uint64_t max_context_ = 0;
+  std::uint32_t suppressed_token_count_ = 0;
 };
 
 double Milliseconds(std::chrono::steady_clock::duration duration) {
@@ -831,10 +903,37 @@ Result<GreedyInferenceResult> RunGreedyInference(const GreedyInferenceOptions& o
       return Error(StatusCode::kInvalidArgument, "input token ID exceeds vocabulary");
     }
   }
+  for (const std::uint32_t token : options.stop_token_ids) {
+    if (token >= kVocabulary) {
+      return Error(StatusCode::kInvalidArgument, "stop token ID exceeds vocabulary");
+    }
+  }
+  for (const std::uint32_t token : options.suppressed_token_ids) {
+    if (token >= kVocabulary) {
+      return Error(StatusCode::kInvalidArgument, "suppressed token ID exceeds vocabulary");
+    }
+  }
+
+  PinnedHostAllocation captured_logits;
+  if (!options.logits_dump_path.empty()) {
+    if constexpr (std::endian::native != std::endian::little) {
+      return Error(StatusCode::kUnsupported,
+                   "raw full-logit dumps currently require a little-endian host");
+    }
+    if (options.max_generated_tokens >
+        std::numeric_limits<std::size_t>::max() / kVocabulary) {
+      return Error(StatusCode::kInvalidArgument, "requested logit capture is too large");
+    }
+    Status status = captured_logits.Allocate(
+        static_cast<std::size_t>(options.max_generated_tokens * kVocabulary));
+    if (!status.ok()) return status;
+  }
 
   const auto load_start = std::chrono::steady_clock::now();
   InferenceEngine engine;
   Status status = engine.Initialize(options.model_directory, options.max_context_tokens);
+  if (!status.ok()) return status;
+  status = engine.SetSuppressedTokens(options.suppressed_token_ids);
   if (!status.ok()) return status;
   const auto load_end = std::chrono::steady_clock::now();
 
@@ -852,28 +951,67 @@ Result<GreedyInferenceResult> RunGreedyInference(const GreedyInferenceOptions& o
   std::uint32_t next_token = 0;
   for (std::size_t index = 0; index < options.input_token_ids.size(); ++index) {
     const bool select = index + 1U == options.input_token_ids.size();
-    auto forwarded = engine.Forward(options.input_token_ids[index], index, select);
+    const std::span<float> logit_capture =
+        select && !captured_logits.span().empty()
+            ? captured_logits.span().first(static_cast<std::size_t>(kVocabulary))
+            : std::span<float>();
+    auto forwarded =
+        engine.Forward(options.input_token_ids[index], index, select, logit_capture);
     if (!forwarded.ok()) return forwarded.status();
     if (select) next_token = forwarded.value();
   }
   const auto prompt_end = std::chrono::steady_clock::now();
   result.prompt_milliseconds = Milliseconds(prompt_end - prompt_start);
   result.output_token_ids.push_back(next_token);
+  if (std::find(options.stop_token_ids.begin(), options.stop_token_ids.end(), next_token) !=
+      options.stop_token_ids.end()) {
+    result.stopped = true;
+    result.stop_token_id = next_token;
+  }
 
   const auto decode_start = std::chrono::steady_clock::now();
-  for (std::uint64_t generated = 1U; generated < options.max_generated_tokens; ++generated) {
+  for (std::uint64_t generated = 1U;
+       generated < options.max_generated_tokens && !result.stopped; ++generated) {
     const std::uint64_t position = options.input_token_ids.size() + generated - 1U;
-    auto forwarded = engine.Forward(next_token, position, true);
+    const std::size_t logit_offset =
+        static_cast<std::size_t>(generated * kVocabulary);
+    const std::span<float> logit_capture =
+        captured_logits.span().empty()
+            ? std::span<float>()
+            : captured_logits.span().subspan(logit_offset,
+                                             static_cast<std::size_t>(kVocabulary));
+    auto forwarded = engine.Forward(next_token, position, true, logit_capture);
     if (!forwarded.ok()) return forwarded.status();
     next_token = forwarded.value();
     result.output_token_ids.push_back(next_token);
+    if (std::find(options.stop_token_ids.begin(), options.stop_token_ids.end(), next_token) !=
+        options.stop_token_ids.end()) {
+      result.stopped = true;
+      result.stop_token_id = next_token;
+    }
   }
   const auto decode_end = std::chrono::steady_clock::now();
   result.decode_milliseconds = Milliseconds(decode_end - decode_start);
-  const std::uint64_t measured_decode_tokens = options.max_generated_tokens - 1U;
+  const std::uint64_t measured_decode_tokens =
+      result.output_token_ids.empty() ? 0U : result.output_token_ids.size() - 1U;
   if (measured_decode_tokens != 0U && result.decode_milliseconds > 0.0) {
     result.decode_tokens_per_second =
         static_cast<double>(measured_decode_tokens) * 1000.0 / result.decode_milliseconds;
+  }
+  if (!options.logits_dump_path.empty()) {
+    result.logits_dump_steps = result.output_token_ids.size();
+    const std::size_t dump_elements =
+        static_cast<std::size_t>(result.logits_dump_steps * kVocabulary);
+    std::ofstream dump(options.logits_dump_path, std::ios::binary | std::ios::trunc);
+    if (!dump) {
+      return Error(StatusCode::kIoError, "cannot open full-logit dump");
+    }
+    dump.write(reinterpret_cast<const char*>(captured_logits.span().data()),
+               static_cast<std::streamsize>(dump_elements * sizeof(float)));
+    if (!dump) {
+      return Error(StatusCode::kIoError, "failed to write full-logit dump");
+    }
+    result.logits_dumped = true;
   }
   return result;
 }
@@ -895,6 +1033,18 @@ Status WriteGreedyInferenceJson(const GreedyInferenceResult& result, std::ostrea
          << "  \"weight_arena_bytes\": " << result.weight_arena_bytes << ",\n"
          << "  \"kv_cache_bytes\": " << result.kv_cache_bytes << ",\n"
          << "  \"workspace_bytes\": " << result.workspace_bytes << ",\n"
+         << "  \"logits_dumped\": " << (result.logits_dumped ? "true" : "false") << ",\n"
+         << "  \"logits_dump_format\": \"raw_float32_little_endian\",\n"
+         << "  \"logits_dump_steps\": " << result.logits_dump_steps << ",\n"
+         << "  \"logits_dump_vocabulary\": " << kVocabulary << ",\n"
+         << "  \"finish_reason\": \"" << (result.stopped ? "stop" : "length") << "\",\n"
+         << "  \"stop_token_id\": ";
+  if (result.stopped) {
+    output << result.stop_token_id;
+  } else {
+    output << "null";
+  }
+  output << ",\n"
          << "  \"output_token_ids\": [";
   for (std::size_t index = 0; index < result.output_token_ids.size(); ++index) {
     if (index != 0U) output << ',';

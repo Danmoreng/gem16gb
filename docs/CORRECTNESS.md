@@ -78,6 +78,35 @@ numeric tolerance. The next trusted fixture must use a real token sequence and c
 Layer-0 output, and matching K/V state needed to reproduce the selected decode position. The current deterministic
 synthetic-cache characterization cannot honestly be compared directly with a prompt-derived hidden state.
 
+The full-model greedy characterization now has two explicit generation gates. For
+`exact_blue_no_thinking`, the checkpoint tokenizer and exact `chat_template.jinja` produce the committed 20 prompt
+IDs, and the engine matches vLLM's complete `[9503, 106]` response (`blue<turn|>`). For the 31-token
+`sky_sentence_no_thinking` reference, the engine matches `[818, 7217]` and diverges at generated step 2: vLLM
+selects token `563`, while the engine selects vLLM's rank-2 token `7412`. This is a blocking correctness failure,
+not an accepted numerical tolerance.
+
+`--dump-logits` captures every selected position as full-vocabulary raw little-endian float32 after preallocating
+host storage, and `tools/compare_logits.py` compares it with the committed vLLM top-20 distributions. At the first
+divergent position, the reference token `563` is engine rank 2 with engine log probability `-1.56273` versus vLLM
+`-0.06586`; token `7412` is engine rank 1 with `-0.23527` versus vLLM `-2.75336`. The discrepancy is too large to
+attribute to an argmax tie. Full-vocabulary vLLM vectors and prompt-derived hidden/KV states remain necessary to
+locate the earliest failing layer.
+
+The native C++ tokenizer/template path reproduces all three committed reference prompt-ID sequences exactly:
+20 tokens for exact-blue, 23 for the sky sentence, and 27 for the thinking arithmetic prompt. The application reads
+the actual template file and accepts only the pinned supported revision. Its renderer currently supports
+system/developer, user, and assistant text roles; tool calls and multimodal content fail visibly until their native
+template branches are implemented. A separate German/Unicode probe containing umlauts, `ß`, and an emoji also
+matches the Transformers tokenizer exactly across all 27 prompt IDs.
+
+The patched same-source llama.cpp candidate supplies an independent comparison despite mapping FP8 attention
+weights to BF16. It matches 50/65 reference output tokens overall: exact-blue is 2/2, the sky answer matches its
+first 18 tokens before diverging, and the thinking trace matches 28/32. At our first sky divergence, both vLLM and
+llama.cpp choose token `563`; our engine chooses token `7412`. The engine top-20 overlap is 13/20 against vLLM and
+15/20 against llama.cpp at that step. Cross-engine bit identity is not required, but agreement between both
+independent references and their nontrivial top-1 margin makes this early deviation a correctness investigation,
+not an accepted implementation difference.
+
 Reproduce the instruction check with:
 
 ```bash
@@ -86,8 +115,8 @@ python tools/verify_sm120_sass.py build/<OS>/blackwell-release/bin/gem16gb-cuda-
 
 ## Not yet established
 
-Broad projection distributions, layer tolerances, full-vocabulary logits, trusted-runtime hidden-state comparisons,
-cross-engine generation agreement, and task quality have not been measured. Therefore `tests/tolerances.yaml` is
+Broad projection distributions, layer tolerances, full-vocabulary reference logits, trusted-runtime hidden-state
+comparisons, broad cross-engine generation agreement, and task quality have not been measured. Therefore `tests/tolerances.yaml` is
 intentionally empty. The committed vLLM
 fixture provides greedy token IDs and top-20 log probabilities, but it is not a substitute for full-logit Level 3
 metrics. Tolerances will be added only after reference distributions exist.

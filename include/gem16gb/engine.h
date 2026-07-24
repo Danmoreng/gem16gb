@@ -15,12 +15,16 @@ void PrintKernelCapabilities(std::ostream& output);
 struct GreedyInferenceOptions {
   std::filesystem::path model_directory;
   std::vector<std::uint32_t> input_token_ids;
+  std::vector<std::uint32_t> stop_token_ids;
+  std::vector<std::uint32_t> suppressed_token_ids;
+  std::filesystem::path logits_dump_path;
   std::uint64_t max_generated_tokens = 1;
   std::uint64_t max_context_tokens = 128;
 };
 
 struct GreedyInferenceResult {
   std::vector<std::uint32_t> output_token_ids;
+  std::uint32_t stop_token_id = 0;
   double model_load_milliseconds = 0.0;
   double prompt_milliseconds = 0.0;
   double decode_milliseconds = 0.0;
@@ -29,9 +33,12 @@ struct GreedyInferenceResult {
   std::uint64_t kv_cache_bytes = 0;
   std::uint64_t workspace_bytes = 0;
   std::uint64_t fallback_count = 0;
+  std::uint64_t logits_dump_steps = 0;
   bool source_layout_direct = false;
   bool token_loop_allocations = false;
   bool benchmark_qualified = false;
+  bool stopped = false;
+  bool logits_dumped = false;
 };
 
 // Correctness-first, batch-one CUDA characterization. It accepts already-tokenized input,

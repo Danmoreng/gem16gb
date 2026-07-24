@@ -10,8 +10,14 @@ of the correctness and native-kernel gates below.
 
 - The first arena-backed 48-layer decode characterization loads all text-only tensors once, uses fixed
   BF16-semantics K/V and workspace arenas, executes the tied output head and GPU argmax, and reproduces the two
-  committed greedy tokens for `exact_blue_no_thinking`. Extend this from token agreement to full-vocabulary logits,
-  prompt-derived layer states, 32 decode steps, and the required 512-token stability gate before qualification.
+  committed greedy tokens for `exact_blue_no_thinking`. The longer `sky_sentence_no_thinking` gate agrees for two
+  tokens and then selects vLLM rank 2 at step 2. Use the implemented full-logit dump and top-20 comparison to
+  localize this prompt-history/state divergence before 32-step and 512-token qualification.
+- The pure C++ chat CLI now uses native byte-fallback BPE from `tokenizer.json`, a version-bound implementation of
+  the exact checkpoint `chat_template.jinja`, and its EOS/suppressed-token lists. Retain the model across turns and
+  replace serialized prompt ingestion with native prefill after resolving the early distribution divergence.
+- Keep chat processing independent of terminal I/O so a later OpenAI-compatible Chat Completions server can reuse
+  it. Do not begin HTTP/server work before persistent engine sessions and the correctness gate are in place.
 - Replace token-at-a-time prompt ingestion with a separate native prefill plan. The current prompt timing is a
   correctness bridge and must not be reported as prompt throughput.
 - Replace the initial contiguous cache, currently capped at 1,024 total positions, with circular local storage and
@@ -52,7 +58,8 @@ The llama.cpp benchmark is deliberately before engine kernel optimization, but a
 ## Next milestones
 
 1. Accept or reject the patched closest-parity characterization, then establish viable llama.cpp tiers B and C.
-2. Capture full-vocabulary reference logits and selected hidden states, then add an engine logit-dump comparison.
+2. Capture full-vocabulary vLLM reference logits and selected hidden states. The engine raw-float32 logit dump and
+   comparison against the committed vLLM top-20 fixture are implemented; full reference vectors remain pending.
 3. ~~Implement the exact host NVFP4 codec and projection oracle, including real-checkpoint byte-pattern fixtures.~~
 4. ~~Implement an explicit correctness-only CUDA W4A4 route that consumes packed E2M1 values and E4M3 scales.~~
 5. ~~Implement and round-trip-test direct SM120 fragment views over source weight/scale storage for Gate, Up, and

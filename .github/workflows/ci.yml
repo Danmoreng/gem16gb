@@ -32,6 +32,7 @@ jobs:
           python3 -m py_compile \
             tools/compare_manifests.py \
             tools/benchmark_vllm.py \
+            tools/compare_logits.py \
             tools/fetch_model.py \
             tools/generate_golden.py \
             tools/generate_llama_golden.py \
@@ -65,6 +66,6 @@ jobs:
       - name: Check Python tools
         shell: pwsh
         run: |
-          python -m py_compile tools/compare_manifests.py tools/benchmark_vllm.py tools/fetch_model.py tools/generate_golden.py tools/generate_llama_golden.py tools/inspect_checkpoint.py tools/inspect_gguf.py tools/validate_inference.py tools/validate_layer_checkpoint.py tools/verify_sm120_sass.py tools/summarize_llama_bench.py
+          python -m py_compile tools/compare_manifests.py tools/benchmark_vllm.py tools/compare_logits.py tools/fetch_model.py tools/generate_golden.py tools/generate_llama_golden.py tools/inspect_checkpoint.py tools/inspect_gguf.py tools/validate_inference.py tools/validate_layer_checkpoint.py tools/verify_sm120_sass.py tools/summarize_llama_bench.py
           python -m unittest discover -s tests/python -v
         working-directory: source

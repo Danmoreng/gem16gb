@@ -33,3 +33,8 @@ Every plan reports both byte formulas for auditability, requires an explicit lay
 Checked multiplication, addition, and alignment reject integer overflow. Activation A/B, logits, sampling, CUDA
 Graph, kernel, and prefill workspaces remain explicitly unplanned until their execution shapes are defined;
 `total_arena_bytes` is therefore the known base arena, not a peak-VRAM claim.
+
+The current full-model characterization separately measures a 9,200,135,680-byte aligned device weight arena and
+a roughly 1.47 MB reusable workspace. Its temporary cache stores BF16-semantics K/V as float32 and therefore is not
+the production FP8 budget above; at 64 positions it allocates 44,040,192 bytes. Optional full-logit diagnostics use
+host memory (`steps * 262144 * 4` bytes) allocated before generation and do not change persistent device storage.

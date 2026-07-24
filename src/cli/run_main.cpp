@@ -38,6 +38,9 @@ void PrintUsage() {
       << "Usage:\n"
       << "  gem16gb-run --print-kernel-capabilities\n"
       << "  gem16gb-run --model <checkpoint> --input-token-ids <id,id,...>\n"
+      << "              [--stop-token-ids <id,id,...>]\n"
+      << "              [--suppress-token-ids <id,id,...>]\n"
+      << "              [--dump-logits <raw-f32-path>]\n"
       << "              [--max-tokens N] [--max-context N] --greedy\n"
       << "\nThe inference path is a correctness characterization and is not benchmark-qualified.\n";
 }
@@ -75,6 +78,18 @@ int main(int argc, char** argv) {
         std::cerr << "error: --max-context must be an unsigned integer\n";
         return 64;
       }
+    } else if (argument == "--stop-token-ids" && index + 1 < argc) {
+      if (!ParseTokenIds(argv[++index], options.stop_token_ids)) {
+        std::cerr << "error: --stop-token-ids must be a comma-separated unsigned list\n";
+        return 64;
+      }
+    } else if (argument == "--suppress-token-ids" && index + 1 < argc) {
+      if (!ParseTokenIds(argv[++index], options.suppressed_token_ids)) {
+        std::cerr << "error: --suppress-token-ids must be a comma-separated unsigned list\n";
+        return 64;
+      }
+    } else if (argument == "--dump-logits" && index + 1 < argc) {
+      options.logits_dump_path = argv[++index];
     } else if (argument == "--greedy") {
       greedy = true;
     } else {

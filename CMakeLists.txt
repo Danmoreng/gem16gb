@@ -30,6 +30,7 @@ add_library(gem16gb_core STATIC
   src/model/config.cpp
   src/model/manifest.cpp
   src/model/safetensors.cpp
+  src/model/tokenizer.cpp
   src/runtime/capabilities.cpp
   src/runtime/memory.cpp
   src/runtime/memory_plan.cpp
@@ -131,7 +132,7 @@ else()
   message(STATUS "gem16gb CUDA capability scaffold: disabled")
 endif()
 
-foreach(tool IN ITEMS inspect run bench)
+foreach(tool IN ITEMS inspect run bench chat)
   add_executable(gem16gb-${tool} src/cli/${tool}_main.cpp)
   target_link_libraries(gem16gb-${tool} PRIVATE gem16gb_core)
   gem16gb_set_project_warnings(gem16gb-${tool})
@@ -149,6 +150,7 @@ if(BUILD_TESTING AND GEM16GB_BUILD_TESTS)
     tests/unit/nvfp4_test.cpp
     tests/unit/safetensors_test.cpp
     tests/unit/sm120_layout_test.cpp
+    tests/unit/tokenizer_test.cpp
     tests/unit/test_main.cpp
   )
   target_include_directories(gem16gb-unit-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src" "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit")

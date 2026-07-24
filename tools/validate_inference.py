@@ -73,6 +73,21 @@ def main() -> int:
         prompt = select_prompt(golden, args.prompt_id)
         input_ids = prompt.get("prompt_token_ids")
         expected = prompt.get("output_token_ids")
+        generation = json.loads(
+            (model / "generation_config.json").read_text(encoding="utf-8")
+        )
+        stop_tokens = generation.get("eos_token_id")
+        if isinstance(stop_tokens, int):
+            stop_tokens = [stop_tokens]
+        suppressed_tokens = generation.get("suppress_tokens", [])
+        if (
+            not isinstance(stop_tokens, list)
+            or not stop_tokens
+            or not all(isinstance(token, int) and token >= 0 for token in stop_tokens)
+            or not isinstance(suppressed_tokens, list)
+            or not all(isinstance(token, int) and token >= 0 for token in suppressed_tokens)
+        ):
+            raise ValidationError("checkpoint generation token controls are malformed")
         if not isinstance(input_ids, list) or not input_ids or not all(
             isinstance(token, int) and token >= 0 for token in input_ids
         ):
@@ -93,7 +108,16 @@ def main() -> int:
             "--max-context",
             str(context),
             "--greedy",
+            "--stop-token-ids",
+            ",".join(str(token) for token in stop_tokens),
         ]
+        if suppressed_tokens:
+            command.extend(
+                [
+                    "--suppress-token-ids",
+                    ",".join(str(token) for token in suppressed_tokens),
+                ]
+            )
         completed = subprocess.run(command, check=False, capture_output=True, text=True)
         if completed.returncode != 0:
             raise ValidationError(
