@@ -10,6 +10,7 @@
 #include "platform/mapped_file.h"
 
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -101,14 +102,15 @@ class PinnedHostAllocation {
     if (data_ != nullptr) (void)cudaFreeHost(data_);
   }
 
-  [[nodiscard]] Status Allocate(std::size_t elements) {
+  [[nodiscard]] Status Allocate(std::size_t elements, const char* label) {
     if (data_ != nullptr || elements == 0U ||
         elements > std::numeric_limits<std::size_t>::max() / sizeof(float)) {
-      return Error(StatusCode::kInvalidArgument, "pinned full-logit capture size is invalid");
+      return Error(StatusCode::kInvalidArgument,
+                   std::string("pinned ") + label + " size is invalid");
     }
     const cudaError_t error =
         cudaHostAlloc(&data_, elements * sizeof(float), cudaHostAllocDefault);
-    if (error != cudaSuccess) return CudaFailure("allocate pinned full-logit capture", error);
+    if (error != cudaSuccess) return CudaFailure(label, error);
     elements_ = elements;
     return Status::Ok();
   }
@@ -121,6 +123,59 @@ class PinnedHostAllocation {
   void* data_ = nullptr;
   std::size_t elements_ = 0;
 };
+
+struct LayerStateCapture {
+  std::size_t attention_context = 0;
+  std::size_t attention_elements = 0;
+  std::size_t attention_output = 0;
+  std::size_t post_attention_norm = 0;
+  std::size_t post_attention_residual = 0;
+  std::size_t pre_feedforward_norm = 0;
+  std::size_t gate = 0;
+  std::size_t up = 0;
+  std::size_t gelu_product = 0;
+  std::size_t mlp_output = 0;
+  std::size_t post_feedforward_norm = 0;
+  std::size_t hidden = 0;
+  std::size_t key = 0;
+  std::size_t value = 0;
+  std::size_t kv_elements = 0;
+};
+
+struct StateCaptureLayout {
+  std::array<LayerStateCapture, kLayers> layers{};
+  std::size_t elements = 0;
+};
+
+StateCaptureLayout MakeStateCaptureLayout() {
+  StateCaptureLayout layout;
+  for (std::size_t layer = 0; layer < kLayers; ++layer) {
+    const bool global = layer % 6U == 5U;
+    const std::size_t kv_elements =
+        global ? 512U : static_cast<std::size_t>(8U * 256U);
+    LayerStateCapture& capture = layout.layers[layer];
+    capture.attention_context = layout.elements;
+    capture.attention_elements =
+        global ? static_cast<std::size_t>(16U * 512U)
+               : static_cast<std::size_t>(16U * 256U);
+    capture.attention_output =
+        capture.attention_context + capture.attention_elements;
+    capture.post_attention_norm = capture.attention_output + kHidden;
+    capture.post_attention_residual = capture.post_attention_norm + kHidden;
+    capture.pre_feedforward_norm = capture.post_attention_residual + kHidden;
+    capture.gate = capture.pre_feedforward_norm + kHidden;
+    capture.up = capture.gate + kIntermediate;
+    capture.gelu_product = capture.up + kIntermediate;
+    capture.mlp_output = capture.gelu_product + kIntermediate;
+    capture.post_feedforward_norm = capture.mlp_output + kHidden;
+    capture.hidden = capture.post_feedforward_norm + kHidden;
+    capture.key = capture.hidden + kHidden;
+    capture.value = capture.key + kv_elements;
+    capture.kv_elements = kv_elements;
+    layout.elements = capture.value + kv_elements;
+  }
+  return layout;
+}
 
 struct DeviceTensor {
   const TensorInfo* info = nullptr;
@@ -165,8 +220,12 @@ struct LayerBinding {
   const std::uint16_t* pre_mlp_norm = nullptr;
   const std::uint16_t* post_mlp_norm = nullptr;
   const std::uint16_t* layer_scalar = nullptr;
-  float* key_cache = nullptr;
-  float* value_cache = nullptr;
+  const std::uint16_t* k_cache_scale = nullptr;
+  const std::uint16_t* v_cache_scale = nullptr;
+  float* key_cache_bf16 = nullptr;
+  float* value_cache_bf16 = nullptr;
+  std::uint8_t* key_cache_fp8 = nullptr;
+  std::uint8_t* value_cache_fp8 = nullptr;
 };
 
 class LoadedModel {
@@ -242,9 +301,15 @@ class LoadedModel {
   [[nodiscard]] const std::uint16_t* final_norm() const { return final_norm_; }
   [[nodiscard]] std::uint64_t weight_bytes() const { return weights_.bytes(); }
 
-  void SetLayerCache(std::size_t layer, float* key, float* value) {
-    layers_[layer].key_cache = key;
-    layers_[layer].value_cache = value;
+  void SetLayerBf16Cache(std::size_t layer, float* key, float* value) {
+    layers_[layer].key_cache_bf16 = key;
+    layers_[layer].value_cache_bf16 = value;
+  }
+
+  void SetLayerFp8Cache(std::size_t layer, std::uint8_t* key,
+                        std::uint8_t* value) {
+    layers_[layer].key_cache_fp8 = key;
+    layers_[layer].value_cache_fp8 = value;
   }
 
  private:
@@ -363,6 +428,8 @@ class LoadedModel {
       auto pre_mlp = Bf16(base + "pre_feedforward_layernorm.weight", kHidden);
       auto post_mlp = Bf16(base + "post_feedforward_layernorm.weight", kHidden);
       auto scalar = Bf16(base + "layer_scalar", 1U);
+      auto k_cache_scale = Bf16(base + "self_attn.k_scale", 1U);
+      auto v_cache_scale = Bf16(base + "self_attn.v_scale", 1U);
       if (!input_norm.ok()) return input_norm.status();
       if (!q_norm.ok()) return q_norm.status();
       if (!k_norm.ok()) return k_norm.status();
@@ -370,6 +437,8 @@ class LoadedModel {
       if (!pre_mlp.ok()) return pre_mlp.status();
       if (!post_mlp.ok()) return post_mlp.status();
       if (!scalar.ok()) return scalar.status();
+      if (!k_cache_scale.ok()) return k_cache_scale.status();
+      if (!v_cache_scale.ok()) return v_cache_scale.status();
       layer.input_norm = input_norm.value();
       layer.q_norm = q_norm.value();
       layer.k_norm = k_norm.value();
@@ -377,6 +446,8 @@ class LoadedModel {
       layer.pre_mlp_norm = pre_mlp.value();
       layer.post_mlp_norm = post_mlp.value();
       layer.layer_scalar = scalar.value();
+      layer.k_cache_scale = k_cache_scale.value();
+      layer.v_cache_scale = v_cache_scale.value();
     }
     return Status::Ok();
   }
@@ -530,7 +601,13 @@ Status LaunchRoundBf16(float* values, std::uint64_t elements, cudaStream_t strea
 }
 
 Status LaunchFp8Projection(const std::uint8_t* activation, const float* scale,
-                           const Fp8Binding& binding, float* output, cudaStream_t stream) {
+                           const Fp8Binding& binding, float* output,
+                           ProjectionPath path, cudaStream_t stream) {
+  if (path == ProjectionPath::kCudaReference) {
+    return internal::LaunchFp8ReferenceProjection(
+        activation, scale, binding.weight, binding.scales, output, binding.rows,
+        binding.contracting, stream);
+  }
   return internal::LaunchFp8Sm120DirectProjection(
       activation, scale, binding.weight, binding.scales, output, binding.rows,
       binding.contracting, stream);
@@ -538,7 +615,12 @@ Status LaunchFp8Projection(const std::uint8_t* activation, const float* scale,
 
 Status LaunchNvfp4Projection(const std::uint8_t* activation, const std::uint8_t* scales,
                              const Nvfp4Binding& binding, float* output,
-                             cudaStream_t stream) {
+                             ProjectionPath path, cudaStream_t stream) {
+  if (path == ProjectionPath::kCudaReference) {
+    return internal::LaunchNvfp4ReferenceProjection(
+        activation, scales, binding.packed_weight, binding.scales, output, binding.rows,
+        binding.contracting, binding.input_divisor, binding.weight_divisor, stream);
+  }
   return internal::LaunchNvfp4Sm120DirectProjection(
       activation, scales, binding.packed_weight, binding.scales, output, binding.rows,
       binding.contracting, binding.input_divisor, binding.weight_divisor, stream);
@@ -554,8 +636,12 @@ class InferenceEngine {
   }
 
   [[nodiscard]] Status Initialize(const std::filesystem::path& model_directory,
-                                  std::uint64_t max_context) {
+                                  std::uint64_t max_context,
+                                  ProjectionPath projection_path,
+                                  KvCacheMode kv_cache_mode) {
     max_context_ = max_context;
+    projection_path_ = projection_path;
+    kv_cache_mode_ = kv_cache_mode;
     cudaDeviceProp properties{};
     cudaError_t error = cudaGetDeviceProperties(&properties, 0);
     if (error != cudaSuccess) return CudaFailure("cudaGetDeviceProperties", error);
@@ -579,9 +665,13 @@ class InferenceEngine {
 
   [[nodiscard]] Result<std::uint32_t> Forward(
       std::uint32_t token, std::uint64_t position, bool select_token,
-      std::span<float> host_logits = {}) {
+      std::span<float> host_logits = {}, std::span<float> host_state = {}) {
     if (token >= kVocabulary || position >= max_context_) {
       return Error(StatusCode::kInvalidArgument, "token or position exceeds inference plan");
+    }
+    const StateCaptureLayout state_layout = MakeStateCaptureLayout();
+    if (!host_state.empty() && host_state.size() != state_layout.elements) {
+      return Error(StatusCode::kInternal, "host state capture span has invalid size");
     }
     float* hidden_a = Pointer<float>(workspace_, offsets_.hidden_a);
     EmbeddingKernel<<<static_cast<unsigned>((kHidden + kThreads - 1U) / kThreads), kThreads,
@@ -589,8 +679,13 @@ class InferenceEngine {
     cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess) return CudaFailure("launch embedding", error);
 
-    for (const auto& layer : model_.layers()) {
-      Status status = RunLayer(layer, position);
+    for (std::size_t layer_index = 0; layer_index < model_.layers().size();
+         ++layer_index) {
+      const auto& layer = model_.layers()[layer_index];
+      const LayerStateCapture* layer_capture =
+          host_state.empty() ? nullptr : &state_layout.layers[layer_index];
+      Status status =
+          RunLayer(layer, position, layer_capture, host_state.data());
       if (!status.ok()) return status;
     }
     float* normalized = Pointer<float>(workspace_, offsets_.normalized);
@@ -599,7 +694,15 @@ class InferenceEngine {
     if (!status.ok()) return status;
     status = LaunchRoundBf16(normalized, kHidden, stream_);
     if (!status.ok()) return status;
-    if (!select_token) return 0U;
+    if (!select_token) {
+      if (!host_state.empty()) {
+        error = cudaStreamSynchronize(stream_);
+        if (error != cudaSuccess) {
+          return CudaFailure("synchronize layer state capture", error);
+        }
+      }
+      return 0U;
+    }
 
     float* logits = Pointer<float>(workspace_, offsets_.logits);
     auto* selected = Pointer<std::uint32_t>(workspace_, offsets_.selected);
@@ -656,19 +759,35 @@ class InferenceEngine {
     std::array<CacheOffsets, kLayers> offsets{};
     for (std::size_t index = 0; index < kLayers; ++index) {
       const auto& layer = model_.layers()[index];
-      auto key = layout.Add<float>(max_context_ * layer.kv_elements);
-      auto value = layout.Add<float>(max_context_ * layer.kv_elements);
+      Result<std::uint64_t> key =
+          kv_cache_mode_ == KvCacheMode::kCheckpointFp8
+              ? layout.Add<std::uint8_t>(max_context_ * layer.kv_elements)
+              : layout.Add<float>(max_context_ * layer.kv_elements);
+      Result<std::uint64_t> value =
+          kv_cache_mode_ == KvCacheMode::kCheckpointFp8
+              ? layout.Add<std::uint8_t>(max_context_ * layer.kv_elements)
+              : layout.Add<float>(max_context_ * layer.kv_elements);
       if (!key.ok()) return key.status();
       if (!value.ok()) return value.status();
       offsets[index] = {key.value(), value.value()};
     }
     auto size = AlignUp(layout.size(), kAlignment);
     if (!size.ok()) return size.status();
-    Status status = cache_.Allocate(size.value(), "allocate BF16-semantics KV cache");
+    Status status = cache_.Allocate(
+        size.value(), kv_cache_mode_ == KvCacheMode::kCheckpointFp8
+                          ? "allocate checkpoint FP8 KV cache"
+                          : "allocate BF16-semantics KV cache");
     if (!status.ok()) return status;
     for (std::size_t index = 0; index < kLayers; ++index) {
-      model_.SetLayerCache(index, Pointer<float>(cache_, offsets[index].key),
-                           Pointer<float>(cache_, offsets[index].value));
+      if (kv_cache_mode_ == KvCacheMode::kCheckpointFp8) {
+        model_.SetLayerFp8Cache(
+            index, Pointer<std::uint8_t>(cache_, offsets[index].key),
+            Pointer<std::uint8_t>(cache_, offsets[index].value));
+      } else {
+        model_.SetLayerBf16Cache(
+            index, Pointer<float>(cache_, offsets[index].key),
+            Pointer<float>(cache_, offsets[index].value));
+      }
     }
     return Status::Ok();
   }
@@ -715,7 +834,9 @@ class InferenceEngine {
     return workspace_.Allocate(size.value(), "allocate inference workspace arena");
   }
 
-  [[nodiscard]] Status RunLayer(const LayerBinding& layer, std::uint64_t position) {
+  [[nodiscard]] Status RunLayer(const LayerBinding& layer, std::uint64_t position,
+                                const LayerStateCapture* capture,
+                                float* host_state) {
     float* hidden_a = Pointer<float>(workspace_, offsets_.hidden_a);
     float* hidden_b = Pointer<float>(workspace_, offsets_.hidden_b);
     float* normalized = Pointer<float>(workspace_, offsets_.normalized);
@@ -733,6 +854,23 @@ class InferenceEngine {
     float* o_scale = Pointer<float>(workspace_, offsets_.o_scale);
     float* projection = Pointer<float>(workspace_, offsets_.projection);
     float* post_norm = Pointer<float>(workspace_, offsets_.post_norm);
+    const auto capture_values =
+        [this, capture, host_state](std::size_t offset, const float* source,
+                                    std::size_t elements,
+                                    const char* label) -> Status {
+      if (capture == nullptr) return Status::Ok();
+      const cudaError_t error = cudaMemcpyAsync(
+          host_state + offset, source,
+          elements * sizeof(float),
+          cudaMemcpyDeviceToHost, stream_);
+      return error == cudaSuccess ? Status::Ok() : CudaFailure(label, error);
+    };
+    const auto capture_hidden =
+        [&capture_values](std::size_t offset, const float* source,
+                          const char* label) -> Status {
+      return capture_values(offset, source, static_cast<std::size_t>(kHidden),
+                            label);
+    };
 
     Status status = internal::LaunchRmsNorm(hidden_a, layer.input_norm, normalized, 1U,
                                             kHidden, kEpsilon, stream_);
@@ -742,16 +880,19 @@ class InferenceEngine {
     status = internal::LaunchFp8ReferenceTokenQuantization(
         normalized, fp8_activation, fp8_scale, kHidden, stream_);
     if (!status.ok()) return status;
-    status = LaunchFp8Projection(fp8_activation, fp8_scale, layer.q, q, stream_);
+    status = LaunchFp8Projection(fp8_activation, fp8_scale, layer.q, q,
+                                 projection_path_, stream_);
     if (!status.ok()) return status;
-    status = LaunchFp8Projection(fp8_activation, fp8_scale, layer.k, k, stream_);
+    status = LaunchFp8Projection(fp8_activation, fp8_scale, layer.k, k,
+                                 projection_path_, stream_);
     if (!status.ok()) return status;
     if (layer.global) {
       const cudaError_t error = cudaMemcpyAsync(v, k, layer.kv_elements * sizeof(float),
                                                 cudaMemcpyDeviceToDevice, stream_);
       if (error != cudaSuccess) return CudaFailure("reuse global K projection for V", error);
     } else {
-      status = LaunchFp8Projection(fp8_activation, fp8_scale, layer.v, v, stream_);
+      status = LaunchFp8Projection(fp8_activation, fp8_scale, layer.v, v,
+                                   projection_path_, stream_);
       if (!status.ok()) return status;
     }
     for (const Status next : {
@@ -789,31 +930,86 @@ class InferenceEngine {
     if (!status.ok()) return status;
     status = LaunchRoundBf16(k_norm, layer.kv_elements, stream_);
     if (!status.ok()) return status;
-    status = internal::LaunchAppendKv(k_norm, v_norm, layer.key_cache, layer.value_cache,
-                                      position, layer.kv_heads, layer.head_dimension, stream_);
-    if (!status.ok()) return status;
-    status = internal::LaunchLocalAttentionDecode(
-        q_norm, layer.key_cache, layer.value_cache, scores, attention, kQueryHeads,
-        layer.kv_heads, layer.head_dimension, position + 1U, stream_);
+    if (capture != nullptr) {
+      const std::size_t kv_bytes = capture->kv_elements * sizeof(float);
+      cudaError_t capture_error = cudaMemcpyAsync(
+          host_state + capture->key, k_norm, kv_bytes, cudaMemcpyDeviceToHost,
+          stream_);
+      if (capture_error != cudaSuccess) {
+        return CudaFailure("copy layer K input state", capture_error);
+      }
+      capture_error = cudaMemcpyAsync(
+          host_state + capture->value, v_norm, kv_bytes,
+          cudaMemcpyDeviceToHost, stream_);
+      if (capture_error != cudaSuccess) {
+        return CudaFailure("copy layer V input state", capture_error);
+      }
+    }
+    if (kv_cache_mode_ == KvCacheMode::kCheckpointFp8) {
+      status = internal::LaunchAppendKvFp8(
+          k_norm, v_norm, layer.key_cache_fp8, layer.value_cache_fp8,
+          layer.k_cache_scale, layer.v_cache_scale, position, layer.kv_heads,
+          layer.head_dimension, stream_);
+      if (!status.ok()) return status;
+      status = internal::LaunchLocalAttentionDecodeFp8(
+          q_norm, layer.key_cache_fp8, layer.value_cache_fp8,
+          layer.k_cache_scale, layer.v_cache_scale, scores, attention,
+          kQueryHeads, layer.kv_heads, layer.head_dimension, position + 1U,
+          stream_);
+    } else {
+      status = internal::LaunchAppendKv(
+          k_norm, v_norm, layer.key_cache_bf16, layer.value_cache_bf16,
+          position, layer.kv_heads, layer.head_dimension, stream_);
+      if (!status.ok()) return status;
+      status = internal::LaunchLocalAttentionDecode(
+          q_norm, layer.key_cache_bf16, layer.value_cache_bf16, scores,
+          attention, kQueryHeads, layer.kv_heads, layer.head_dimension,
+          position + 1U, stream_);
+    }
     if (!status.ok()) return status;
     status = LaunchRoundBf16(attention, layer.query_elements, stream_);
     if (!status.ok()) return status;
+    if (capture != nullptr) {
+      const cudaError_t capture_error = cudaMemcpyAsync(
+          host_state + capture->attention_context, attention,
+          capture->attention_elements * sizeof(float),
+          cudaMemcpyDeviceToHost, stream_);
+      if (capture_error != cudaSuccess) {
+        return CudaFailure("copy attention context state", capture_error);
+      }
+    }
     status = internal::LaunchFp8ReferenceTokenQuantization(
         attention, o_activation, o_scale, layer.query_elements, stream_);
     if (!status.ok()) return status;
-    status = LaunchFp8Projection(o_activation, o_scale, layer.o, projection, stream_);
+    status = LaunchFp8Projection(o_activation, o_scale, layer.o, projection,
+                                 projection_path_, stream_);
     if (!status.ok()) return status;
     status = LaunchRoundBf16(projection, kHidden, stream_);
     if (!status.ok()) return status;
+    if (capture != nullptr) {
+      status = capture_hidden(capture->attention_output, projection,
+                              "copy attention output state");
+      if (!status.ok()) return status;
+    }
     status = internal::LaunchRmsNorm(projection, layer.post_attention_norm, post_norm, 1U,
                                     kHidden, kEpsilon, stream_);
     if (!status.ok()) return status;
     status = LaunchRoundBf16(post_norm, kHidden, stream_);
     if (!status.ok()) return status;
+    if (capture != nullptr) {
+      status = capture_hidden(capture->post_attention_norm, post_norm,
+                              "copy post-attention norm state");
+      if (!status.ok()) return status;
+    }
     status = internal::LaunchAddResidual(post_norm, hidden_a, hidden_b, kHidden, stream_);
     if (!status.ok()) return status;
     status = LaunchRoundBf16(hidden_b, kHidden, stream_);
     if (!status.ok()) return status;
+    if (capture != nullptr) {
+      status = capture_hidden(capture->post_attention_residual, hidden_b,
+                              "copy post-attention residual state");
+      if (!status.ok()) return status;
+    }
 
     auto* mlp_packed = Pointer<std::uint8_t>(workspace_, offsets_.mlp_packed);
     auto* mlp_scales = Pointer<std::uint8_t>(workspace_, offsets_.mlp_scales);
@@ -827,40 +1023,78 @@ class InferenceEngine {
     if (!status.ok()) return status;
     status = LaunchRoundBf16(normalized, kHidden, stream_);
     if (!status.ok()) return status;
+    if (capture != nullptr) {
+      status = capture_hidden(capture->pre_feedforward_norm, normalized,
+                              "copy pre-feedforward norm state");
+      if (!status.ok()) return status;
+    }
     status = internal::LaunchNvfp4ReferenceActivationQuantization(
         normalized, mlp_packed, mlp_scales, kHidden, layer.gate.input_divisor, stream_);
     if (!status.ok()) return status;
-    status = LaunchNvfp4Projection(mlp_packed, mlp_scales, layer.gate, gate, stream_);
+    status = LaunchNvfp4Projection(mlp_packed, mlp_scales, layer.gate, gate,
+                                   projection_path_, stream_);
     if (!status.ok()) return status;
-    status = LaunchNvfp4Projection(mlp_packed, mlp_scales, layer.up, up, stream_);
+    status = LaunchNvfp4Projection(mlp_packed, mlp_scales, layer.up, up,
+                                   projection_path_, stream_);
     if (!status.ok()) return status;
     status = LaunchRoundBf16(gate, kIntermediate, stream_);
     if (!status.ok()) return status;
     status = LaunchRoundBf16(up, kIntermediate, stream_);
     if (!status.ok()) return status;
+    if (capture != nullptr) {
+      status = capture_values(capture->gate, gate, kIntermediate,
+                              "copy MLP gate state");
+      if (!status.ok()) return status;
+      status = capture_values(capture->up, up, kIntermediate,
+                              "copy MLP up state");
+      if (!status.ok()) return status;
+    }
     status = internal::LaunchGeluTanhProduct(gate, up, product, kIntermediate, stream_);
     if (!status.ok()) return status;
     status = LaunchRoundBf16(product, kIntermediate, stream_);
     if (!status.ok()) return status;
+    if (capture != nullptr) {
+      status = capture_values(capture->gelu_product, product, kIntermediate,
+                              "copy MLP GELU product state");
+      if (!status.ok()) return status;
+    }
     status = internal::LaunchNvfp4ReferenceActivationQuantization(
         product, down_packed, down_scales, kIntermediate, layer.down.input_divisor, stream_);
     if (!status.ok()) return status;
-    status = LaunchNvfp4Projection(down_packed, down_scales, layer.down, projection, stream_);
+    status = LaunchNvfp4Projection(down_packed, down_scales, layer.down, projection,
+                                   projection_path_, stream_);
     if (!status.ok()) return status;
     status = LaunchRoundBf16(projection, kHidden, stream_);
     if (!status.ok()) return status;
+    if (capture != nullptr) {
+      status = capture_hidden(capture->mlp_output, projection,
+                              "copy MLP output state");
+      if (!status.ok()) return status;
+    }
     status = internal::LaunchRmsNorm(projection, layer.post_mlp_norm, post_norm, 1U, kHidden,
                                     kEpsilon, stream_);
     if (!status.ok()) return status;
     status = LaunchRoundBf16(post_norm, kHidden, stream_);
     if (!status.ok()) return status;
+    if (capture != nullptr) {
+      status = capture_hidden(capture->post_feedforward_norm, post_norm,
+                              "copy post-feedforward norm state");
+      if (!status.ok()) return status;
+    }
     status = internal::LaunchAddResidual(post_norm, hidden_b, hidden_a, kHidden, stream_);
     if (!status.ok()) return status;
     status = LaunchRoundBf16(hidden_a, kHidden, stream_);
     if (!status.ok()) return status;
     status = internal::LaunchScale(hidden_a, layer.layer_scalar, kHidden, stream_);
     if (!status.ok()) return status;
-    return LaunchRoundBf16(hidden_a, kHidden, stream_);
+    status = LaunchRoundBf16(hidden_a, kHidden, stream_);
+    if (!status.ok()) return status;
+    if (capture != nullptr) {
+      status =
+          capture_hidden(capture->hidden, hidden_a, "copy layer hidden state");
+      if (!status.ok()) return status;
+    }
+    return Status::Ok();
   }
 
   LoadedModel model_;
@@ -870,10 +1104,92 @@ class InferenceEngine {
   cudaStream_t stream_ = nullptr;
   std::uint64_t max_context_ = 0;
   std::uint32_t suppressed_token_count_ = 0;
+  ProjectionPath projection_path_ = ProjectionPath::kNativeSm120;
+  KvCacheMode kv_cache_mode_ = KvCacheMode::kCheckpointFp8;
 };
 
 double Milliseconds(std::chrono::steady_clock::duration duration) {
   return std::chrono::duration<double, std::milli>(duration).count();
+}
+
+Status WriteStateDump(const std::filesystem::path& path, std::uint64_t position,
+                      ProjectionPath projection_path,
+                      KvCacheMode kv_cache_mode,
+                      std::span<const float> captured_state) {
+  if constexpr (std::endian::native != std::endian::little) {
+    return Error(StatusCode::kUnsupported,
+                 "state dumps currently require a little-endian host");
+  }
+  const StateCaptureLayout layout = MakeStateCaptureLayout();
+  if (captured_state.size() != layout.elements) {
+    return Error(StatusCode::kInternal, "captured state has invalid size");
+  }
+  std::ofstream dump(path, std::ios::binary | std::ios::trunc);
+  if (!dump) return Error(StatusCode::kIoError, "cannot open layer-state dump");
+
+  constexpr std::array<char, 8> kMagic = {'G', '1', '6', 'S', 'T', '0', '0', '1'};
+  const auto write = [&dump](const auto& value) {
+    dump.write(reinterpret_cast<const char*>(&value),
+               static_cast<std::streamsize>(sizeof(value)));
+  };
+  dump.write(kMagic.data(), static_cast<std::streamsize>(kMagic.size()));
+  const std::uint32_t version = 5U;
+  const std::uint32_t layer_count = static_cast<std::uint32_t>(kLayers);
+  const std::uint64_t hidden_elements = kHidden;
+  const std::uint64_t total_elements =
+      static_cast<std::uint64_t>(captured_state.size());
+  const std::uint32_t path_id =
+      projection_path == ProjectionPath::kNativeSm120 ? 0U : 1U;
+  const std::uint32_t kv_cache_mode_id =
+      kv_cache_mode == KvCacheMode::kCheckpointFp8 ? 0U : 1U;
+  write(version);
+  write(layer_count);
+  write(position);
+  write(hidden_elements);
+  write(total_elements);
+  write(path_id);
+  write(kv_cache_mode_id);
+
+  for (std::size_t layer = 0; layer < kLayers; ++layer) {
+    const LayerStateCapture& capture = layout.layers[layer];
+    const std::uint32_t layer_index = static_cast<std::uint32_t>(layer);
+    const std::uint32_t flags = layer % 6U == 5U ? 1U : 0U;
+    const std::uint64_t kv_elements =
+        static_cast<std::uint64_t>(capture.kv_elements);
+    write(layer_index);
+    write(flags);
+    write(kv_elements);
+    dump.write(
+        reinterpret_cast<const char*>(
+            captured_state.data() + capture.attention_context),
+        static_cast<std::streamsize>(
+            capture.attention_elements * sizeof(float)));
+    for (const auto [offset, elements] :
+         {std::pair{capture.attention_output,
+                    static_cast<std::size_t>(kHidden)},
+          std::pair{capture.post_attention_norm,
+                    static_cast<std::size_t>(kHidden)},
+          std::pair{capture.post_attention_residual,
+                    static_cast<std::size_t>(kHidden)},
+          std::pair{capture.pre_feedforward_norm,
+                    static_cast<std::size_t>(kHidden)},
+          std::pair{capture.gate, static_cast<std::size_t>(kIntermediate)},
+          std::pair{capture.up, static_cast<std::size_t>(kIntermediate)},
+          std::pair{capture.gelu_product,
+                    static_cast<std::size_t>(kIntermediate)},
+          std::pair{capture.mlp_output, static_cast<std::size_t>(kHidden)},
+          std::pair{capture.post_feedforward_norm,
+                    static_cast<std::size_t>(kHidden)},
+          std::pair{capture.hidden, static_cast<std::size_t>(kHidden)},
+          std::pair{capture.key, capture.kv_elements},
+          std::pair{capture.value, capture.kv_elements}}) {
+      dump.write(reinterpret_cast<const char*>(captured_state.data() + offset),
+                 static_cast<std::streamsize>(elements * sizeof(float)));
+    }
+  }
+  return dump.good() ? Status::Ok()
+                     : Error(StatusCode::kIoError,
+                             "failed to write layer-state dump");
 }
 
 }  // namespace
@@ -897,6 +1213,20 @@ Result<GreedyInferenceResult> RunGreedyInference(const GreedyInferenceOptions& o
           options.max_context_tokens - options.input_token_ids.size()) {
     return Error(StatusCode::kInvalidArgument,
                  "prompt plus generated decode positions exceed --max-context");
+  }
+  if (options.state_dump_path.empty() !=
+      !options.state_dump_position.has_value()) {
+    return Error(StatusCode::kInvalidArgument,
+                 "--dump-state and --dump-state-position must be used together");
+  }
+  if (options.state_dump_position.has_value()) {
+    const std::uint64_t maximum_forward_position =
+        static_cast<std::uint64_t>(options.input_token_ids.size()) +
+        options.max_generated_tokens - 2U;
+    if (*options.state_dump_position > maximum_forward_position) {
+      return Error(StatusCode::kInvalidArgument,
+                   "state dump position is outside the requested inference");
+    }
   }
   for (const std::uint32_t token : options.input_token_ids) {
     if (token >= kVocabulary) {
@@ -925,13 +1255,22 @@ Result<GreedyInferenceResult> RunGreedyInference(const GreedyInferenceOptions& o
       return Error(StatusCode::kInvalidArgument, "requested logit capture is too large");
     }
     Status status = captured_logits.Allocate(
-        static_cast<std::size_t>(options.max_generated_tokens * kVocabulary));
+        static_cast<std::size_t>(options.max_generated_tokens * kVocabulary),
+        "full-logit capture");
+    if (!status.ok()) return status;
+  }
+  PinnedHostAllocation captured_state;
+  if (!options.state_dump_path.empty()) {
+    Status status = captured_state.Allocate(MakeStateCaptureLayout().elements,
+                                            "layer-state capture");
     if (!status.ok()) return status;
   }
 
   const auto load_start = std::chrono::steady_clock::now();
   InferenceEngine engine;
-  Status status = engine.Initialize(options.model_directory, options.max_context_tokens);
+  Status status = engine.Initialize(options.model_directory, options.max_context_tokens,
+                                    options.projection_path,
+                                    options.kv_cache_mode);
   if (!status.ok()) return status;
   status = engine.SetSuppressedTokens(options.suppressed_token_ids);
   if (!status.ok()) return status;
@@ -939,6 +1278,8 @@ Result<GreedyInferenceResult> RunGreedyInference(const GreedyInferenceOptions& o
 
   GreedyInferenceResult result;
   result.output_token_ids.reserve(static_cast<std::size_t>(options.max_generated_tokens));
+  result.projection_path = options.projection_path;
+  result.kv_cache_mode = options.kv_cache_mode;
   result.model_load_milliseconds = Milliseconds(load_end - load_start);
   result.weight_arena_bytes = engine.weight_bytes();
   result.kv_cache_bytes = engine.cache_bytes();
@@ -949,15 +1290,21 @@ Result<GreedyInferenceResult> RunGreedyInference(const GreedyInferenceOptions& o
 
   const auto prompt_start = std::chrono::steady_clock::now();
   std::uint32_t next_token = 0;
+  bool state_captured = false;
   for (std::size_t index = 0; index < options.input_token_ids.size(); ++index) {
     const bool select = index + 1U == options.input_token_ids.size();
     const std::span<float> logit_capture =
         select && !captured_logits.span().empty()
             ? captured_logits.span().first(static_cast<std::size_t>(kVocabulary))
             : std::span<float>();
-    auto forwarded =
-        engine.Forward(options.input_token_ids[index], index, select, logit_capture);
+    const bool capture_state =
+        options.state_dump_position.has_value() &&
+        *options.state_dump_position == index;
+    auto forwarded = engine.Forward(
+        options.input_token_ids[index], index, select, logit_capture,
+        capture_state ? captured_state.span() : std::span<float>());
     if (!forwarded.ok()) return forwarded.status();
+    state_captured = state_captured || capture_state;
     if (select) next_token = forwarded.value();
   }
   const auto prompt_end = std::chrono::steady_clock::now();
@@ -980,8 +1327,14 @@ Result<GreedyInferenceResult> RunGreedyInference(const GreedyInferenceOptions& o
             ? std::span<float>()
             : captured_logits.span().subspan(logit_offset,
                                              static_cast<std::size_t>(kVocabulary));
-    auto forwarded = engine.Forward(next_token, position, true, logit_capture);
+    const bool capture_state =
+        options.state_dump_position.has_value() &&
+        *options.state_dump_position == position;
+    auto forwarded = engine.Forward(
+        next_token, position, true, logit_capture,
+        capture_state ? captured_state.span() : std::span<float>());
     if (!forwarded.ok()) return forwarded.status();
+    state_captured = state_captured || capture_state;
     next_token = forwarded.value();
     result.output_token_ids.push_back(next_token);
     if (std::find(options.stop_token_ids.begin(), options.stop_token_ids.end(), next_token) !=
@@ -1013,6 +1366,19 @@ Result<GreedyInferenceResult> RunGreedyInference(const GreedyInferenceOptions& o
     }
     result.logits_dumped = true;
   }
+  if (!options.state_dump_path.empty()) {
+    if (!state_captured) {
+      return Error(StatusCode::kInvalidArgument,
+                   "generation stopped before the requested state dump position");
+    }
+    status = WriteStateDump(options.state_dump_path,
+                            *options.state_dump_position,
+                            options.projection_path, options.kv_cache_mode,
+                            captured_state.span());
+    if (!status.ok()) return status;
+    result.state_dumped = true;
+    result.state_dump_position = *options.state_dump_position;
+  }
   return result;
 }
 
@@ -1021,6 +1387,21 @@ Status WriteGreedyInferenceJson(const GreedyInferenceResult& result, std::ostrea
          << "  \"status\": \"characterization\",\n"
          << "  \"benchmark_qualified\": false,\n"
          << "  \"precision\": \"bf16_state_fp8_attention_nvfp4_mlp\",\n"
+         << "  \"projection_path\": \""
+         << (result.projection_path == ProjectionPath::kNativeSm120
+                 ? "native_sm120"
+                 : "cuda_reference")
+         << "\",\n"
+         << "  \"kv_cache_mode\": \""
+         << (result.kv_cache_mode == KvCacheMode::kCheckpointFp8
+                 ? "checkpoint_fp8"
+                 : "bf16_correctness")
+         << "\",\n"
+         << "  \"kv_cache_storage\": \""
+         << (result.kv_cache_mode == KvCacheMode::kCheckpointFp8
+                 ? "uint8_e4m3fn"
+                 : "float32_bf16_semantics")
+         << "\",\n"
          << "  \"fallbacks\": " << result.fallback_count << ",\n"
          << "  \"source_layout_direct\": "
          << (result.source_layout_direct ? "true" : "false") << ",\n"
@@ -1037,6 +1418,16 @@ Status WriteGreedyInferenceJson(const GreedyInferenceResult& result, std::ostrea
          << "  \"logits_dump_format\": \"raw_float32_little_endian\",\n"
          << "  \"logits_dump_steps\": " << result.logits_dump_steps << ",\n"
          << "  \"logits_dump_vocabulary\": " << kVocabulary << ",\n"
+         << "  \"state_dumped\": "
+         << (result.state_dumped ? "true" : "false") << ",\n"
+         << "  \"state_dump_format\": \"gem16gb_layer_state_v5\",\n"
+         << "  \"state_dump_position\": ";
+  if (result.state_dumped) {
+    output << result.state_dump_position;
+  } else {
+    output << "null";
+  }
+  output << ",\n"
          << "  \"finish_reason\": \"" << (result.stopped ? "stop" : "length") << "\",\n"
          << "  \"stop_token_id\": ";
   if (result.stopped) {

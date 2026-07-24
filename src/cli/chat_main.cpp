@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -62,6 +63,9 @@ void PrintUsage() {
       << "Usage:\n"
       << "  gem16gb-chat --model <checkpoint> [--max-tokens N] [--max-context N]\n"
       << "                [--thinking] [--system <text>]\n"
+      << "                [--projection-path native|reference]\n"
+      << "                [--kv-cache fp8|bf16]\n"
+      << "                [--dump-state <path> --dump-state-position N]\n"
       << "  gem16gb-chat --model <checkpoint> --message <text> [--json]\n"
       << "  gem16gb-chat --model <checkpoint> --message <text> --render-only --json\n";
 }
@@ -77,6 +81,12 @@ struct Options {
   bool thinking = false;
   bool render_only = false;
   bool json = false;
+  std::filesystem::path state_dump_path;
+  std::optional<std::uint64_t> state_dump_position;
+  gem16gb::ProjectionPath projection_path =
+      gem16gb::ProjectionPath::kNativeSm120;
+  gem16gb::KvCacheMode kv_cache_mode =
+      gem16gb::KvCacheMode::kCheckpointFp8;
 };
 
 gem16gb::Result<Options> ParseOptions(int argc, char** argv) {
@@ -107,6 +117,36 @@ gem16gb::Result<Options> ParseOptions(int argc, char** argv) {
       options.render_only = true;
     } else if (argument == "--json") {
       options.json = true;
+    } else if (argument == "--dump-state" && index + 1 < argc) {
+      options.state_dump_path = argv[++index];
+    } else if (argument == "--dump-state-position" && index + 1 < argc) {
+      std::uint64_t position = 0;
+      if (!ParseUnsigned(argv[++index], position)) {
+        return gem16gb::Status(
+            gem16gb::StatusCode::kInvalidArgument,
+            "--dump-state-position must be an unsigned integer");
+      }
+      options.state_dump_position = position;
+    } else if (argument == "--projection-path" && index + 1 < argc) {
+      const std::string_view path = argv[++index];
+      if (path == "native") {
+        options.projection_path = gem16gb::ProjectionPath::kNativeSm120;
+      } else if (path == "reference") {
+        options.projection_path = gem16gb::ProjectionPath::kCudaReference;
+      } else {
+        return gem16gb::Status(gem16gb::StatusCode::kInvalidArgument,
+                              "--projection-path must be native or reference");
+      }
+    } else if (argument == "--kv-cache" && index + 1 < argc) {
+      const std::string_view mode = argv[++index];
+      if (mode == "fp8") {
+        options.kv_cache_mode = gem16gb::KvCacheMode::kCheckpointFp8;
+      } else if (mode == "bf16") {
+        options.kv_cache_mode = gem16gb::KvCacheMode::kBf16Correctness;
+      } else {
+        return gem16gb::Status(gem16gb::StatusCode::kInvalidArgument,
+                              "--kv-cache must be fp8 or bf16");
+      }
     } else {
       return gem16gb::Status(gem16gb::StatusCode::kInvalidArgument,
                             "unknown or incomplete option: " +
@@ -122,6 +162,13 @@ gem16gb::Result<Options> ParseOptions(int argc, char** argv) {
     return gem16gb::Status(
         gem16gb::StatusCode::kInvalidArgument,
         "--render-only and --json require a one-shot --message");
+  }
+  if ((!options.state_dump_path.empty() ||
+       options.state_dump_position.has_value()) &&
+      !options.has_one_shot_message) {
+    return gem16gb::Status(
+        gem16gb::StatusCode::kInvalidArgument,
+        "state capture requires a one-shot --message");
   }
   if (options.max_tokens == 0U || options.max_context == 0U) {
     return gem16gb::Status(gem16gb::StatusCode::kInvalidArgument,
@@ -164,6 +211,10 @@ gem16gb::Result<TurnOutput> RunTurn(
       processor.generation_controls().suppressed_token_ids;
   inference_options.max_generated_tokens = cli.max_tokens;
   inference_options.max_context_tokens = cli.max_context;
+  inference_options.projection_path = cli.projection_path;
+  inference_options.kv_cache_mode = cli.kv_cache_mode;
+  inference_options.state_dump_path = cli.state_dump_path;
+  inference_options.state_dump_position = cli.state_dump_position;
   auto inference = gem16gb::RunGreedyInference(inference_options);
   if (!inference.ok()) return inference.status();
 
@@ -191,6 +242,20 @@ gem16gb::Result<TurnOutput> RunTurn(
     WriteTokenIds(inference.value().output_token_ids);
     std::cout << ",\"finish_reason\":"
               << JsonEscape(inference.value().stopped ? "stop" : "length")
+              << ",\"projection_path\":"
+              << JsonEscape(
+                     inference.value().projection_path ==
+                             gem16gb::ProjectionPath::kNativeSm120
+                         ? "native_sm120"
+                         : "cuda_reference")
+              << ",\"state_dumped\":"
+              << (inference.value().state_dumped ? "true" : "false")
+              << ",\"kv_cache_mode\":"
+              << JsonEscape(
+                     inference.value().kv_cache_mode ==
+                             gem16gb::KvCacheMode::kCheckpointFp8
+                         ? "checkpoint_fp8"
+                         : "bf16_correctness")
               << ",\"benchmark_qualified\":false}\n";
   }
   return TurnOutput{std::move(assistant_content).value(),

@@ -22,16 +22,19 @@ approximately 16 GB of VRAM. The first model is the mixed FP8/NVFP4
   trusted-hidden-state or performance qualification.
 - A CUDA-only, batch-one greedy characterization now loads the complete text model into one weight arena, executes
   all 48 layers with separate K/V caches, applies the tied BF16 output head and exact logit softcap, and selects the
-  token on the GPU. The pinned 20-token prompt reproduces both committed greedy tokens exactly with zero fallbacks
-  and no allocation in the token loop. Checkpoint EOS and suppressed-token controls are applied explicitly.
+  token on the GPU. The default applies the checkpoint's static E4M3 FP8 K/V scales; an explicit BF16 correctness
+  mode remains available. Both modes run with zero fallbacks and no allocation in the token loop. Checkpoint EOS
+  and suppressed-token controls are applied explicitly.
 - `gem16gb-chat` is a pure C++ application. It loads the checkpoint's `tokenizer.json`, performs native
   byte-fallback BPE encode/decode, enforces the pinned `chat_template.jinja` contract, and sources EOS/suppressed
   tokens from `generation_config.json`.
 
 Optimized prefill, contexts beyond the initial contiguous 1,024-token cache, sampling, CUDA Graphs, persistent chat
-sessions, and benchmark-qualified inference do **not** work yet. A longer committed reference chat diverges at its
-third generated token, so the CLI is useful for development conversations but the early distribution difference
-remains under investigation. Unsupported modes fail visibly and never fall back to a higher precision path.
+sessions, and benchmark-qualified inference do **not** work yet. The default cache now stores one physical E4M3FN
+byte per K/V value and dequantizes with the checkpoint's per-layer BF16 scales during attention. It is still an
+unfused correctness kernel rather than a performance result. The exact-blue greedy gate passes, while the longer
+sky gate currently diverges from vLLM/llama.cpp at its third generated token. Unsupported modes fail visibly and
+never fall back to a higher precision path.
 
 ## Build on Linux
 
@@ -66,6 +69,10 @@ build/Linux/blackwell-release/bin/gem16gb-run \
   --greedy
 ```
 
+The checkpoint-declared FP8 K/V semantics are the default. Use `--kv-cache bf16` only for the explicitly labeled
+BF16 correctness comparison. `--projection-path reference` selects the slow CUDA scalar projections; it is never
+an automatic fallback.
+
 Reproduce the committed-token gate without copying token IDs manually:
 
 ```bash
@@ -95,6 +102,11 @@ build/Linux/blackwell-release/bin/gem16gb-chat \
 
 `--render-only --json` validates prompt rendering and token IDs without loading CUDA weights. No Python interpreter,
 Transformers installation, server, or subprocess is involved in the chat application.
+
+For prompt-derived layer diagnostics, add `--dump-state <file> --dump-state-position <position>`. The capture
+preallocates pinned storage and writes only after generation. `tools/dump_vllm_states.py` emits the same
+self-describing format from the pinned reference runtime, and `tools/compare_states.py` compares attention context,
+layer intermediates, final hidden states, K, and V.
 
 ## Build on Windows
 

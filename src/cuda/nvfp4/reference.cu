@@ -32,6 +32,12 @@ __device__ std::uint8_t LoadNibble(const std::uint8_t* packed, std::uint64_t ind
   return static_cast<std::uint8_t>((byte >> shift) & 0x0FU);
 }
 
+__device__ __forceinline__ float ReciprocalApproximateFtz(float value) {
+  float result;
+  asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(result) : "f"(value));
+  return result;
+}
+
 __global__ void QuantizeActivationReferenceKernel(const float* input,
                                                   std::uint8_t* packed_e2m1,
                                                   std::uint8_t* block_scales_e4m3fn,
@@ -44,22 +50,24 @@ __global__ void QuantizeActivationReferenceKernel(const float* input,
   float amax = 0.0F;
 #pragma unroll
   for (std::uint64_t local = 0; local < kBlockElements; ++local) {
-    amax = fmaxf(amax, fabsf(input[begin + local] * global_divisor));
+    amax = fmaxf(amax, fabsf(input[begin + local]));
   }
 
-  const __nv_fp8_e4m3 scale(amax / 6.0F);
+  const __nv_fp8_e4m3 scale(
+      (amax * ReciprocalApproximateFtz(6.0F)) * global_divisor);
   block_scales_e4m3fn[block] = scale.__x;
   const float decoded_scale = static_cast<float>(scale);
+  const float output_scale =
+      decoded_scale == 0.0F
+          ? 0.0F
+          : ReciprocalApproximateFtz(
+                decoded_scale * ReciprocalApproximateFtz(global_divisor));
 
 #pragma unroll
   for (std::uint64_t pair = 0; pair < kBlockElements / 2U; ++pair) {
     const std::uint64_t index = begin + pair * 2U;
-    const float low_value = decoded_scale == 0.0F
-                                ? 0.0F
-                                : input[index] * global_divisor / decoded_scale;
-    const float high_value = decoded_scale == 0.0F
-                                 ? 0.0F
-                                 : input[index + 1U] * global_divisor / decoded_scale;
+    const float low_value = input[index] * output_scale;
+    const float high_value = input[index + 1U] * output_scale;
     const __nv_fp4_e2m1 low(low_value);
     const __nv_fp4_e2m1 high(high_value);
     packed_e2m1[index / 2U] =

@@ -13,6 +13,7 @@ namespace {
 constexpr std::array<float, 8> kPositiveE2M1 = {
     0.0F, 0.5F, 1.0F, 1.5F, 2.0F, 3.0F, 4.0F, 6.0F,
 };
+constexpr float kE2M1MaxReciprocal = 1.0F / kE2M1Max;
 
 Status Invalid(std::string message) {
   return Status(StatusCode::kInvalidArgument, std::move(message));
@@ -132,10 +133,11 @@ Result<QuantizedActivation> QuantizeActivation(std::span<const float> activation
       if (!std::isfinite(value)) return Invalid("NVFP4 activation values must be finite");
       const float scaled = value * global_divisor;
       if (!std::isfinite(scaled)) return Invalid("NVFP4 activation scaling overflowed");
-      amax = std::max(amax, std::fabs(scaled));
+      amax = std::max(amax, std::fabs(value));
     }
 
-    const auto encoded_scale = EncodeE4M3Fn(amax / kE2M1Max);
+    const auto encoded_scale =
+        EncodeE4M3Fn((amax * kE2M1MaxReciprocal) * global_divisor);
     if (!encoded_scale.ok()) return encoded_scale.status();
     output.block_scales_e4m3fn[block] = encoded_scale.value();
     const float decoded_scale = DecodeE4M3Fn(encoded_scale.value());

@@ -35,6 +35,8 @@ Graph, kernel, and prefill workspaces remain explicitly unplanned until their ex
 `total_arena_bytes` is therefore the known base arena, not a peak-VRAM claim.
 
 The current full-model characterization separately measures a 9,200,135,680-byte aligned device weight arena and
-a roughly 1.47 MB reusable workspace. Its temporary cache stores BF16-semantics K/V as float32 and therefore is not
-the production FP8 budget above; at 64 positions it allocates 44,040,192 bytes. Optional full-logit diagnostics use
-host memory (`steps * 262144 * 4` bytes) allocated before generation and do not change persistent device storage.
+a roughly 1.47 MB reusable workspace. At 64 positions its contiguous physical E4M3FN K/V cache allocates
+11,010,048 bytes; the explicit float32 BF16-semantics diagnostic cache allocates 44,040,192 bytes. This confirms the
+one-byte payload accounting, but the initial cache does not yet apply sliding-window reclamation. Optional
+full-logit diagnostics use host memory (`steps * 262144 * 4` bytes) allocated before generation and do not change
+persistent device storage.

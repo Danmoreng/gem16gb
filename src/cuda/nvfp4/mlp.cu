@@ -1,5 +1,6 @@
 #include "cuda/nvfp4/mlp.h"
 
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -29,7 +30,8 @@ __global__ void GeluTanhProductKernel(const float* gate, const float* up, float*
   if (index >= elements) return;
   const float value = gate[index];
   const float inner = kSqrtTwoOverPi * (value + kGeluCubic * value * value * value);
-  const float gelu = 0.5F * value * (1.0F + tanhf(inner));
+  const float gelu =
+      static_cast<float>(__float2bfloat16_rn(0.5F * value * (1.0F + tanhf(inner))));
   output[index] = gelu * up[index];
 }
 

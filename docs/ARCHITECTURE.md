@@ -72,5 +72,6 @@ bound are retained in every result; shared physical cache selection is rejected.
 
 The greedy characterization measures a 1,465,856-byte execution workspace containing hidden-state ping-pong,
 quantized activations and scales, projection intermediates, attention scores, full logits, and GPU argmax state.
-Its short-context BF16-semantics cache is a separate measured allocation. The general planner remains conservative
-until production prefill, FP8 cache, graph, and sampling shapes are defined.
+Its default short-context cache stores physical E4M3FN bytes with checkpoint BF16 scales; an explicit float32
+BF16-semantics diagnostic allocation remains available. The general planner remains conservative until production
+prefill, circular/local cache, graph, and sampling shapes are defined.

@@ -78,19 +78,47 @@ numeric tolerance. The next trusted fixture must use a real token sequence and c
 Layer-0 output, and matching K/V state needed to reproduce the selected decode position. The current deterministic
 synthetic-cache characterization cannot honestly be compared directly with a prompt-derived hidden state.
 
-The full-model greedy characterization now has two explicit generation gates. For
+The full-model greedy characterization now has precision-matched generation gates. For
 `exact_blue_no_thinking`, the checkpoint tokenizer and exact `chat_template.jinja` produce the committed 20 prompt
-IDs, and the engine matches vLLM's complete `[9503, 106]` response (`blue<turn|>`). For the 31-token
-`sky_sentence_no_thinking` reference, the engine matches `[818, 7217]` and diverges at generated step 2: vLLM
-selects token `563`, while the engine selects vLLM's rank-2 token `7412`. This is a blocking correctness failure,
-not an accepted numerical tolerance.
+IDs, and the engine matches vLLM's complete `[9503, 106]` response (`blue<turn|>`). The longer
+`sky_sentence_no_thinking` case currently emits `[818, 7217, 7412]` with gem16gb's physical FP8 cache, while
+FP8-vLLM and the compared llama.cpp run emit `[818, 7217, 563]`. Explicit BF16 vLLM and gem16gb both emit
+`[818, 7217, 7412]`. This is deterministic greedy decoding, so the FP8 mismatch remains a blocking correctness
+investigation rather than sampling variation. A previous working-tree revision matched the FP8 references at this
+position, but only through compensating arithmetic errors that have since been corrected; that token match is not
+valid current evidence.
 
 `--dump-logits` captures every selected position as full-vocabulary raw little-endian float32 after preallocating
-host storage, and `tools/compare_logits.py` compares it with the committed vLLM top-20 distributions. At the first
-divergent position, the reference token `563` is engine rank 2 with engine log probability `-1.56273` versus vLLM
-`-0.06586`; token `7412` is engine rank 1 with `-0.23527` versus vLLM `-2.75336`. The discrepancy is too large to
-attribute to an argmax tie. Full-vocabulary vLLM vectors and prompt-derived hidden/KV states remain necessary to
-locate the earliest failing layer.
+host storage, and `tools/compare_logits.py` compares it with the committed vLLM top-20 distributions. The earlier
+BF16-engine versus auto-FP8-vLLM comparison placed token `563` at engine rank 2 and token `7412` at engine rank 1;
+this was a real distribution difference, but it was caused by comparing different K/V modes rather than an argmax
+tie or sampling randomness.
+
+`--dump-state <file> --dump-state-position <position>` captures, for every decoder layer, attention context/output,
+both normalized residual branches, Gate, Up, GELU product, MLP output, final hidden state, and newly appended K/V
+inputs. Pinned host storage is allocated before inference and the self-describing version-5 file records projection
+and K/V-cache modes, then is written only after the token loop. `tools/dump_vllm_states.py` disables vLLM frontend
+multiprocessing for diagnostic hooks and emits the same format; `tools/compare_states.py` reports per-layer RMS,
+maximum, cosine, and optional intra-layer metrics.
+
+The state comparison exposed and fixed two concrete operator errors. vLLM rounds the tanh-GELU result to BF16
+before multiplying it by the BF16 Up projection; gem16gb previously rounded only the product. vLLM's NVFP4
+activation quantizer also uses `rcp.approx.ftz.f32` in both scale construction and normalization, rather than exact
+division. The production CUDA quantizer now follows that arithmetic and a real vLLM boundary fixture pins its
+packed E2M1 bytes and E4M3 scale.
+
+After those fixes, prompt position zero is bit-identical to vLLM through Layers 0–29. The first remaining difference
+is a small Layer-30 attention output difference (attention context is still exact); the discrepancy disappears
+again after Layer 31 and the final captured Layer-47 hidden state is bit-identical. This is strong evidence for the
+projection, norm, RoPE, residual, and MLP contracts at a single-token attention position.
+
+The first cache reuse at prompt position one is now the earliest material mismatch. In Layer 0, gem16gb versus
+FP8-vLLM attention context has RMS `3.846e-3`, maximum `6.25e-2`, and cosine `0.9999921`; the current V input is
+bit-identical and K differs only by RMS `1.249e-4`. By generated position 24 the Layer-0 attention-context
+difference reaches RMS `6.640e-3`, maximum `1.875e-1`, and then propagates through the model. The physical vLLM
+cache was verified as `torch.uint8` E4M3 storage with layout `[blocks, 2, 16, 8, 256]`. The remaining work is
+therefore narrowed to FP8 attention/cache-write arithmetic and attention reduction order, not tokenizer,
+sampling, or the corrected NVFP4 MLP contract.
 
 The native C++ tokenizer/template path reproduces all three committed reference prompt-ID sequences exactly:
 20 tokens for exact-blue, 23 for the sky sentence, and 27 for the thinking arithmetic prompt. The application reads
@@ -100,12 +128,11 @@ template branches are implemented. A separate German/Unicode probe containing um
 matches the Transformers tokenizer exactly across all 27 prompt IDs.
 
 The patched same-source llama.cpp candidate supplies an independent comparison despite mapping FP8 attention
-weights to BF16. It matches 50/65 reference output tokens overall: exact-blue is 2/2, the sky answer matches its
-first 18 tokens before diverging, and the thinking trace matches 28/32. At our first sky divergence, both vLLM and
-llama.cpp choose token `563`; our engine chooses token `7412`. The engine top-20 overlap is 13/20 against vLLM and
-15/20 against llama.cpp at that step. Cross-engine bit identity is not required, but agreement between both
-independent references and their nontrivial top-1 margin makes this early deviation a correctness investigation,
-not an accepted implementation difference.
+weights to BF16. It matches 50/65 reference output tokens overall: exact-blue is 2/2, the sky answer matches vLLM's
+first 18 tokens before diverging, and the thinking trace matches 28/32. At the current first gem16gb sky
+divergence, llama.cpp and FP8-vLLM both select token `563`, while gem16gb selects `7412`. This makes the remaining
+attention discrepancy important even though later cross-engine differences still require distribution and quality
+analysis rather than automatic acceptance or rejection.
 
 Reproduce the instruction check with:
 
@@ -115,8 +142,9 @@ python tools/verify_sm120_sass.py build/<OS>/blackwell-release/bin/gem16gb-cuda-
 
 ## Not yet established
 
-Broad projection distributions, layer tolerances, full-vocabulary reference logits, trusted-runtime hidden-state
-comparisons, broad cross-engine generation agreement, and task quality have not been measured. Therefore `tests/tolerances.yaml` is
+Broad projection distributions, accepted layer tolerances, full-vocabulary reference logits, broad cross-engine
+generation agreement, and task quality have not been measured. Prompt-derived hidden/KV comparison is now
+implemented for selected positions, but no tolerance has yet been accepted. Therefore `tests/tolerances.yaml` is
 intentionally empty. The committed vLLM
 fixture provides greedy token IDs and top-20 log probabilities, but it is not a substitute for full-logit Level 3
 metrics. Tolerances will be added only after reference distributions exist.
@@ -134,6 +162,11 @@ probabilities at every generated position.
 Reference-runtime startup logs are part of the evidence: vLLM must select `CutlassFP8ScaledMMLinearKernel` for the
 attention projections and `FlashInferCutlassNvFp4LinearKernel` for the NVFP4 MLPs. Package selection alone does not
 replace later per-kernel profiling.
+
+The checkpoint declares a static tensor-wise FP8 K/V scheme and stores BF16 `k_scale`/`v_scale` values for every
+layer. With `kv_cache_dtype=auto`, vLLM resolves this declaration to FP8. Reference commands that intend to compare
+the engine's `--kv-cache bf16` mode must therefore pass `kv_cache_dtype=bfloat16` explicitly; otherwise the result
+is not a precision-parity comparison.
 
 Two consecutive runs on 2026-07-21 produced exactly identical prompt IDs, output IDs, and log probabilities. The
 first engine initialization took 119.44 seconds while compiling and autotuning; the warm-cache initialization took

@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <iosfwd>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -12,14 +13,28 @@ namespace gem16gb {
 
 void PrintKernelCapabilities(std::ostream& output);
 
+enum class ProjectionPath {
+  kNativeSm120,
+  kCudaReference,
+};
+
+enum class KvCacheMode {
+  kCheckpointFp8,
+  kBf16Correctness,
+};
+
 struct GreedyInferenceOptions {
   std::filesystem::path model_directory;
   std::vector<std::uint32_t> input_token_ids;
   std::vector<std::uint32_t> stop_token_ids;
   std::vector<std::uint32_t> suppressed_token_ids;
   std::filesystem::path logits_dump_path;
+  std::filesystem::path state_dump_path;
+  std::optional<std::uint64_t> state_dump_position;
   std::uint64_t max_generated_tokens = 1;
   std::uint64_t max_context_tokens = 128;
+  ProjectionPath projection_path = ProjectionPath::kNativeSm120;
+  KvCacheMode kv_cache_mode = KvCacheMode::kCheckpointFp8;
 };
 
 struct GreedyInferenceResult {
@@ -34,11 +49,15 @@ struct GreedyInferenceResult {
   std::uint64_t workspace_bytes = 0;
   std::uint64_t fallback_count = 0;
   std::uint64_t logits_dump_steps = 0;
+  std::uint64_t state_dump_position = 0;
+  ProjectionPath projection_path = ProjectionPath::kNativeSm120;
+  KvCacheMode kv_cache_mode = KvCacheMode::kCheckpointFp8;
   bool source_layout_direct = false;
   bool token_loop_allocations = false;
   bool benchmark_qualified = false;
   bool stopped = false;
   bool logits_dumped = false;
+  bool state_dumped = false;
 };
 
 // Correctness-first, batch-one CUDA characterization. It accepts already-tokenized input,

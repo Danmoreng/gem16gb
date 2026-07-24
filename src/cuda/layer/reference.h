@@ -42,6 +42,17 @@ namespace gem16gb::internal {
                                     std::uint64_t head_dimension,
                                     cudaStream_t stream);
 
+[[nodiscard]] Status LaunchAppendKvFp8(const float* key,
+                                       const float* value,
+                                       std::uint8_t* key_cache,
+                                       std::uint8_t* value_cache,
+                                       const std::uint16_t* key_scale_bf16,
+                                       const std::uint16_t* value_scale_bf16,
+                                       std::uint64_t slot,
+                                       std::uint64_t kv_heads,
+                                       std::uint64_t head_dimension,
+                                       cudaStream_t stream);
+
 // Correctness-first batch-one decode attention. `scores` is a caller-owned
 // workspace of query_heads * tokens floats and is overwritten with probabilities.
 // Computes grouped-query attention over the exact cache view supplied by the
@@ -56,6 +67,20 @@ namespace gem16gb::internal {
                                                 std::uint64_t head_dimension,
                                                 std::uint64_t tokens,
                                                 cudaStream_t stream);
+
+[[nodiscard]] Status LaunchLocalAttentionDecodeFp8(
+    const float* query,
+    const std::uint8_t* key_cache,
+    const std::uint8_t* value_cache,
+    const std::uint16_t* key_scale_bf16,
+    const std::uint16_t* value_scale_bf16,
+    float* scores,
+    float* output,
+    std::uint64_t query_heads,
+    std::uint64_t kv_heads,
+    std::uint64_t head_dimension,
+    std::uint64_t tokens,
+    cudaStream_t stream);
 
 [[nodiscard]] Status LaunchScale(float* values,
                                  const std::uint16_t* scalar_bf16,

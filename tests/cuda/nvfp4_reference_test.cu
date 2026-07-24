@@ -9,9 +9,11 @@
 #include "gem16gb/nvfp4.h"
 
 #include <cuda_runtime.h>
+#include <cuda_fp8.h>
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <iostream>
@@ -141,6 +143,55 @@ void TestCudaIntrinsicConformanceAndProjection() {
   }
 }
 
+void TestVllmNvfp4QuantizationBoundary() {
+  constexpr std::array<float, 16> activation = {
+      -0.1708984375F,       0.5703125F,          -0.4375F,
+      2.777576446533203e-05F, -3.46875F,          -0.000461578369140625F,
+      0.6015625F,          -0.0830078125F,       0.10009765625F,
+      0.06884765625F,      0.69921875F,          -0.000652313232421875F,
+      -0.875F,             6.866455078125e-05F,  -2.682209014892578e-05F,
+      0.8359375F,
+  };
+  constexpr std::array<std::uint8_t, 8> expected_packed = {
+      0x29U, 0x09U, 0x8FU, 0x82U, 0x00U, 0x82U, 0x0BU, 0x38U,
+  };
+  constexpr std::uint8_t expected_scale = 0x26U;
+
+  DeviceBuffer<float> device_activation(activation.size());
+  DeviceBuffer<std::uint8_t> device_packed(expected_packed.size());
+  DeviceBuffer<std::uint8_t> device_scale(1);
+  if (device_activation.get() == nullptr || device_packed.get() == nullptr ||
+      device_scale.get() == nullptr) {
+    return;
+  }
+  if (!CudaOk(cudaMemcpy(device_activation.get(), activation.data(),
+                         device_activation.bytes(), cudaMemcpyHostToDevice),
+              "copy vLLM NVFP4 boundary activation")) {
+    return;
+  }
+  const auto status =
+      gem16gb::internal::LaunchNvfp4ReferenceActivationQuantization(
+          device_activation.get(), device_packed.get(), device_scale.get(),
+          activation.size(), 0.375F, nullptr);
+  CUDA_TEST_CHECK(status.ok());
+  if (!status.ok() ||
+      !CudaOk(cudaDeviceSynchronize(), "vLLM NVFP4 boundary synchronize")) {
+    return;
+  }
+  std::array<std::uint8_t, expected_packed.size()> packed{};
+  std::uint8_t scale = 0;
+  if (!CudaOk(cudaMemcpy(packed.data(), device_packed.get(),
+                         device_packed.bytes(), cudaMemcpyDeviceToHost),
+              "copy vLLM NVFP4 boundary packed values") ||
+      !CudaOk(cudaMemcpy(&scale, device_scale.get(), sizeof(scale),
+                         cudaMemcpyDeviceToHost),
+              "copy vLLM NVFP4 boundary scale")) {
+    return;
+  }
+  CUDA_TEST_CHECK(packed == expected_packed);
+  CUDA_TEST_CHECK(scale == expected_scale);
+}
+
 void StoreNibble(std::vector<std::uint8_t>& packed, std::size_t row, std::size_t k,
                  std::size_t packed_row_bytes, std::uint8_t nibble) {
   std::uint8_t& byte = packed[row * packed_row_bytes + k / 2U];
@@ -236,6 +287,12 @@ float GeluTanhReference(float value) {
                            (value + cubic * value * value * value)));
 }
 
+float RoundBf16Reference(float value) {
+  std::uint32_t bits = std::bit_cast<std::uint32_t>(value);
+  bits += 0x7FFFU + ((bits >> 16U) & 1U);
+  return std::bit_cast<float>(bits & 0xFFFF0000U);
+}
+
 void TestMlpElementwiseBridge() {
   constexpr std::array<float, 9> gate = {
       -4.0F, -1.5F, -0.25F, -0.0F, 0.0F, 0.125F, 0.75F, 2.0F, 5.0F};
@@ -280,7 +337,8 @@ void TestMlpElementwiseBridge() {
     return;
   }
   for (std::size_t index = 0; index < output.size(); ++index) {
-    const float expected = GeluTanhReference(gate[index]) * up[index] + residual[index];
+    const float expected =
+        RoundBf16Reference(GeluTanhReference(gate[index])) * up[index] + residual[index];
     CUDA_TEST_CHECK(std::fabs(output[index] - expected) < 1.0e-6F);
   }
 }
@@ -510,6 +568,105 @@ void TestLocalLayerReferenceOperators() {
   }
 }
 
+void TestPhysicalFp8KvCache() {
+  constexpr std::uint64_t query_heads = 2;
+  constexpr std::uint64_t kv_heads = 1;
+  constexpr std::uint64_t head_dimension = 4;
+  constexpr std::uint64_t tokens = 2;
+  constexpr std::array<std::uint16_t, 1> key_scale = {0x3F00U};    // 0.5
+  constexpr std::array<std::uint16_t, 1> value_scale = {0x3E80U};  // 0.25
+  constexpr std::array<float, 8> query = {
+      1.0F, 0.5F, -0.5F, 0.25F, -0.5F, 1.0F, 0.25F, -0.25F};
+  constexpr std::array<float, 8> keys = {
+      0.5F, 1.0F, -0.5F, 0.25F, 1.5F, -1.0F, 0.75F, 0.0F};
+  constexpr std::array<float, 8> values = {
+      0.25F, 0.5F, -0.25F, 0.125F, 0.75F, -0.5F, 0.375F, 0.0F};
+
+  DeviceBuffer<float> device_query(query.size());
+  DeviceBuffer<float> device_keys(head_dimension);
+  DeviceBuffer<float> device_values(head_dimension);
+  DeviceBuffer<float> device_float_keys(keys.size());
+  DeviceBuffer<float> device_float_values(values.size());
+  DeviceBuffer<std::uint8_t> device_fp8_keys(keys.size());
+  DeviceBuffer<std::uint8_t> device_fp8_values(values.size());
+  DeviceBuffer<std::uint16_t> device_key_scale(key_scale.size());
+  DeviceBuffer<std::uint16_t> device_value_scale(value_scale.size());
+  DeviceBuffer<float> device_scores(query_heads * tokens);
+  DeviceBuffer<float> device_fp8_output(query.size());
+  DeviceBuffer<float> device_float_output(query.size());
+  if (device_query.get() == nullptr || device_keys.get() == nullptr ||
+      device_values.get() == nullptr || device_float_keys.get() == nullptr ||
+      device_float_values.get() == nullptr || device_fp8_keys.get() == nullptr ||
+      device_fp8_values.get() == nullptr || device_key_scale.get() == nullptr ||
+      device_value_scale.get() == nullptr || device_scores.get() == nullptr ||
+      device_fp8_output.get() == nullptr || device_float_output.get() == nullptr) {
+    return;
+  }
+  if (!CudaOk(cudaMemcpy(device_query.get(), query.data(), device_query.bytes(),
+                         cudaMemcpyHostToDevice), "copy FP8-cache query") ||
+      !CudaOk(cudaMemcpy(device_float_keys.get(), keys.data(),
+                         device_float_keys.bytes(), cudaMemcpyHostToDevice),
+              "copy float-cache keys") ||
+      !CudaOk(cudaMemcpy(device_float_values.get(), values.data(),
+                         device_float_values.bytes(), cudaMemcpyHostToDevice),
+              "copy float-cache values") ||
+      !CudaOk(cudaMemcpy(device_key_scale.get(), key_scale.data(),
+                         device_key_scale.bytes(), cudaMemcpyHostToDevice),
+              "copy K cache scale") ||
+      !CudaOk(cudaMemcpy(device_value_scale.get(), value_scale.data(),
+                         device_value_scale.bytes(), cudaMemcpyHostToDevice),
+              "copy V cache scale")) {
+    return;
+  }
+  for (std::uint64_t token = 0; token < tokens; ++token) {
+    if (!CudaOk(cudaMemcpy(device_keys.get(),
+                           keys.data() + token * head_dimension,
+                           device_keys.bytes(), cudaMemcpyHostToDevice),
+                "copy FP8-cache K input") ||
+        !CudaOk(cudaMemcpy(device_values.get(),
+                           values.data() + token * head_dimension,
+                           device_values.bytes(), cudaMemcpyHostToDevice),
+                "copy FP8-cache V input")) {
+      return;
+    }
+    const auto append = gem16gb::internal::LaunchAppendKvFp8(
+        device_keys.get(), device_values.get(), device_fp8_keys.get(),
+        device_fp8_values.get(), device_key_scale.get(),
+        device_value_scale.get(), token, kv_heads, head_dimension, nullptr);
+    CUDA_TEST_CHECK(append.ok());
+    if (!append.ok()) return;
+  }
+  const auto fp8_attention = gem16gb::internal::LaunchLocalAttentionDecodeFp8(
+      device_query.get(), device_fp8_keys.get(), device_fp8_values.get(),
+      device_key_scale.get(), device_value_scale.get(), device_scores.get(),
+      device_fp8_output.get(), query_heads, kv_heads, head_dimension, tokens,
+      nullptr);
+  CUDA_TEST_CHECK(fp8_attention.ok());
+  const auto float_attention = gem16gb::internal::LaunchLocalAttentionDecode(
+      device_query.get(), device_float_keys.get(), device_float_values.get(),
+      device_scores.get(), device_float_output.get(), query_heads, kv_heads,
+      head_dimension, tokens, nullptr);
+  CUDA_TEST_CHECK(float_attention.ok());
+  if (!fp8_attention.ok() || !float_attention.ok() ||
+      !CudaOk(cudaDeviceSynchronize(), "physical FP8 cache synchronize")) {
+    return;
+  }
+  std::array<float, query.size()> fp8_output{};
+  std::array<float, query.size()> float_output{};
+  if (!CudaOk(cudaMemcpy(fp8_output.data(), device_fp8_output.get(),
+                         device_fp8_output.bytes(), cudaMemcpyDeviceToHost),
+              "copy FP8-cache output") ||
+      !CudaOk(cudaMemcpy(float_output.data(), device_float_output.get(),
+                         device_float_output.bytes(), cudaMemcpyDeviceToHost),
+              "copy float-cache output")) {
+    return;
+  }
+  for (std::size_t index = 0; index < fp8_output.size(); ++index) {
+    CUDA_TEST_CHECK(std::fabs(fp8_output[index] - float_output[index]) <
+                    2.0e-6F);
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -519,10 +676,12 @@ int main() {
     return 1;
   }
   TestCudaIntrinsicConformanceAndProjection();
+  TestVllmNvfp4QuantizationBoundary();
   TestDirectSourceSm120Projection();
   TestMlpElementwiseBridge();
   TestFp8ReferenceAndDirectProjection();
   TestLocalLayerReferenceOperators();
+  TestPhysicalFp8KvCache();
   if (failures != 0) {
     std::cerr << failures << " CUDA test assertion(s) failed\n";
     return 1;

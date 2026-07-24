@@ -9,10 +9,11 @@ of the correctness and native-kernel gates below.
 ## Active gate
 
 - The first arena-backed 48-layer decode characterization loads all text-only tensors once, uses fixed
-  BF16-semantics K/V and workspace arenas, executes the tied output head and GPU argmax, and reproduces the two
-  committed greedy tokens for `exact_blue_no_thinking`. The longer `sky_sentence_no_thinking` gate agrees for two
-  tokens and then selects vLLM rank 2 at step 2. Use the implemented full-logit dump and top-20 comparison to
-  localize this prompt-history/state divergence before 32-step and 512-token qualification.
+  workspace/KV arenas, executes the tied output head and GPU argmax, and supports explicit checkpoint-FP8 and BF16
+  K/V semantics. Physical byte-per-value E4M3FN storage is implemented. The exact-blue gate passes, but the sky
+  gate currently diverges from FP8-vLLM and llama.cpp at generated token 3: gem16gb selects `7412`, both references
+  select `563`. State v5 has narrowed the first material difference to Layer-0 attention context at prompt position
+  one. Match cache-write, score/softmax, and value-reduction arithmetic before extending the gate to 512 tokens.
 - The pure C++ chat CLI now uses native byte-fallback BPE from `tokenizer.json`, a version-bound implementation of
   the exact checkpoint `chat_template.jinja`, and its EOS/suppressed-token lists. Retain the model across turns and
   replace serialized prompt ingestion with native prefill after resolving the early distribution divergence.
@@ -20,8 +21,9 @@ of the correctness and native-kernel gates below.
   it. Do not begin HTTP/server work before persistent engine sessions and the correctness gate are in place.
 - Replace token-at-a-time prompt ingestion with a separate native prefill plan. The current prompt timing is a
   correctness bridge and must not be reported as prompt throughput.
-- Replace the initial contiguous cache, currently capped at 1,024 total positions, with circular local storage and
-  independently growing global storage, then qualify FP8 cache semantics.
+- Replace the initial contiguous physical FP8 cache, currently capped at 1,024 total positions, with circular local
+  storage and independently growing global storage. The checkpoint-scale FP8 numerical semantics and one-byte
+  allocation are implemented; fused/optimized attention reads remain pending.
 - Extend the now-committed trusted vLLM token/top-logprob fixture with full-vocabulary logits and selected hidden
   states.
 - Finish the quality and native-dispatch gates for the patched same-source closest-parity GGUF, then select and lock

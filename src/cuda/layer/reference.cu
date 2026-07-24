@@ -1,6 +1,7 @@
 #include "cuda/layer/reference.h"
 
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include <cfloat>
@@ -104,6 +105,33 @@ __global__ void AttentionScoreKernel(const float* query, const float* key_cache,
   scores[pair] = score;
 }
 
+__global__ void AttentionScoreFp8Kernel(
+    const float* query, const std::uint8_t* key_cache,
+    const std::uint16_t* key_scale_bf16, float* scores,
+    std::uint64_t kv_heads, std::uint64_t head_dimension,
+    std::uint64_t tokens, std::uint64_t pairs,
+    std::uint64_t queries_per_kv) {
+  const std::uint64_t pair =
+      static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (pair >= pairs) return;
+  const std::uint64_t query_head = pair / tokens;
+  const std::uint64_t token = pair % tokens;
+  const std::uint64_t kv_head = query_head / queries_per_kv;
+  const float* query_head_data = query + query_head * head_dimension;
+  const std::uint8_t* key =
+      key_cache + (token * kv_heads + kv_head) * head_dimension;
+  const float key_scale =
+      static_cast<float>(__ushort_as_bfloat16(key_scale_bf16[0]));
+  float score = 0.0F;
+  for (std::uint64_t dimension = 0; dimension < head_dimension; ++dimension) {
+    __nv_fp8_e4m3 quantized;
+    quantized.__x = key[dimension];
+    score = fmaf(query_head_data[dimension],
+                 static_cast<float>(quantized) * key_scale, score);
+  }
+  scores[pair] = score;
+}
+
 __global__ void AttentionSoftmaxKernel(float* scores, std::uint64_t tokens) {
   float local_maximum = -FLT_MAX;
   const std::uint64_t base = static_cast<std::uint64_t>(blockIdx.x) * tokens;
@@ -141,6 +169,51 @@ __global__ void AttentionValueKernel(const float* scores, const float* value_cac
   }
   output[element] = value;
   (void)query_heads;
+}
+
+__global__ void AttentionValueFp8Kernel(
+    const float* scores, const std::uint8_t* value_cache,
+    const std::uint16_t* value_scale_bf16, float* output,
+    std::uint64_t query_heads, std::uint64_t kv_heads,
+    std::uint64_t head_dimension, std::uint64_t tokens,
+    std::uint64_t elements, std::uint64_t queries_per_kv) {
+  const std::uint64_t element =
+      static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (element >= elements) return;
+  const std::uint64_t query_head = element / head_dimension;
+  const std::uint64_t dimension = element % head_dimension;
+  const std::uint64_t kv_head = query_head / queries_per_kv;
+  const float value_scale =
+      static_cast<float>(__ushort_as_bfloat16(value_scale_bf16[0]));
+  float value = 0.0F;
+  for (std::uint64_t token = 0; token < tokens; ++token) {
+    const std::uint64_t cache_offset =
+        (token * kv_heads + kv_head) * head_dimension + dimension;
+    __nv_fp8_e4m3 quantized;
+    quantized.__x = value_cache[cache_offset];
+    value = fmaf(scores[query_head * tokens + token],
+                 static_cast<float>(quantized) * value_scale, value);
+  }
+  output[element] = value;
+  (void)query_heads;
+}
+
+__global__ void AppendKvFp8Kernel(
+    const float* key, const float* value, std::uint8_t* key_cache,
+    std::uint8_t* value_cache, const std::uint16_t* key_scale_bf16,
+    const std::uint16_t* value_scale_bf16, std::uint64_t offset,
+    std::uint64_t elements) {
+  const std::uint64_t index =
+      static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= elements) return;
+  const float key_scale =
+      static_cast<float>(__ushort_as_bfloat16(key_scale_bf16[0]));
+  const float value_scale =
+      static_cast<float>(__ushort_as_bfloat16(value_scale_bf16[0]));
+  const __nv_fp8_e4m3 quantized_key(key[index] / key_scale);
+  const __nv_fp8_e4m3 quantized_value(value[index] / value_scale);
+  key_cache[offset + index] = quantized_key.__x;
+  value_cache[offset + index] = quantized_value.__x;
 }
 
 __global__ void ScaleKernel(float* values, const std::uint16_t* scalar,
@@ -243,6 +316,35 @@ Status LaunchAppendKv(const float* key, const float* value, float* key_cache,
   return error == cudaSuccess ? Status::Ok() : CudaFailure("append V cache", error);
 }
 
+Status LaunchAppendKvFp8(
+    const float* key, const float* value, std::uint8_t* key_cache,
+    std::uint8_t* value_cache, const std::uint16_t* key_scale_bf16,
+    const std::uint16_t* value_scale_bf16, std::uint64_t slot,
+    std::uint64_t kv_heads, std::uint64_t head_dimension,
+    cudaStream_t stream) {
+  if (key == nullptr || value == nullptr || key_cache == nullptr ||
+      value_cache == nullptr || key_scale_bf16 == nullptr ||
+      value_scale_bf16 == nullptr) {
+    return Invalid("FP8 KV append requires non-null pointers and scales");
+  }
+  if (kv_heads == 0U || head_dimension == 0U ||
+      kv_heads > std::numeric_limits<std::uint64_t>::max() / head_dimension) {
+    return Invalid("FP8 KV append geometry is invalid");
+  }
+  const std::uint64_t elements = kv_heads * head_dimension;
+  if (slot > std::numeric_limits<std::uint64_t>::max() / elements) {
+    return Invalid("FP8 KV append offset exceeds addressable memory");
+  }
+  const std::uint64_t blocks = Blocks(elements);
+  if (!ValidGrid(blocks)) return Invalid("FP8 KV append grid exceeds CUDA limits");
+  AppendKvFp8Kernel<<<static_cast<unsigned>(blocks), kThreads, 0, stream>>>(
+      key, value, key_cache, value_cache, key_scale_bf16,
+      value_scale_bf16, slot * elements, elements);
+  const cudaError_t error = cudaGetLastError();
+  return error == cudaSuccess ? Status::Ok()
+                              : CudaFailure("launch FP8 KV append", error);
+}
+
 Status LaunchLocalAttentionDecode(const float* query, const float* key_cache,
                                   const float* value_cache, float* scores, float* output,
                                   std::uint64_t query_heads, std::uint64_t kv_heads,
@@ -275,6 +377,57 @@ Status LaunchLocalAttentionDecode(const float* query, const float* key_cache,
       queries_per_kv);
   error = cudaGetLastError();
   return error == cudaSuccess ? Status::Ok() : CudaFailure("launch attention values", error);
+}
+
+Status LaunchLocalAttentionDecodeFp8(
+    const float* query, const std::uint8_t* key_cache,
+    const std::uint8_t* value_cache, const std::uint16_t* key_scale_bf16,
+    const std::uint16_t* value_scale_bf16, float* scores, float* output,
+    std::uint64_t query_heads, std::uint64_t kv_heads,
+    std::uint64_t head_dimension, std::uint64_t tokens,
+    cudaStream_t stream) {
+  if (query == nullptr || key_cache == nullptr || value_cache == nullptr ||
+      key_scale_bf16 == nullptr || value_scale_bf16 == nullptr ||
+      scores == nullptr || output == nullptr) {
+    return Invalid("FP8 local attention requires non-null pointers and scales");
+  }
+  if (query_heads == 0U || kv_heads == 0U || head_dimension == 0U ||
+      tokens == 0U || query_heads % kv_heads != 0U ||
+      query_heads > std::numeric_limits<std::uint64_t>::max() / tokens ||
+      query_heads > std::numeric_limits<std::uint64_t>::max() / head_dimension) {
+    return Invalid("FP8 local attention geometry is invalid");
+  }
+  const std::uint64_t pairs = query_heads * tokens;
+  const std::uint64_t elements = query_heads * head_dimension;
+  const std::uint64_t score_blocks = Blocks(pairs);
+  const std::uint64_t value_blocks = Blocks(elements);
+  if (!ValidGrid(score_blocks) || !ValidGrid(value_blocks) ||
+      !ValidGrid(query_heads)) {
+    return Invalid("FP8 local attention grid exceeds CUDA limits");
+  }
+  const std::uint64_t queries_per_kv = query_heads / kv_heads;
+  AttentionScoreFp8Kernel<<<static_cast<unsigned>(score_blocks), kThreads, 0,
+                            stream>>>(
+      query, key_cache, key_scale_bf16, scores, kv_heads, head_dimension,
+      tokens, pairs, queries_per_kv);
+  cudaError_t error = cudaGetLastError();
+  if (error != cudaSuccess) {
+    return CudaFailure("launch FP8 attention scores", error);
+  }
+  AttentionSoftmaxKernel<<<static_cast<unsigned>(query_heads), kThreads, 0,
+                           stream>>>(scores, tokens);
+  error = cudaGetLastError();
+  if (error != cudaSuccess) {
+    return CudaFailure("launch FP8 attention softmax", error);
+  }
+  AttentionValueFp8Kernel<<<static_cast<unsigned>(value_blocks), kThreads, 0,
+                            stream>>>(
+      scores, value_cache, value_scale_bf16, output, query_heads, kv_heads,
+      head_dimension, tokens, elements, queries_per_kv);
+  error = cudaGetLastError();
+  return error == cudaSuccess
+             ? Status::Ok()
+             : CudaFailure("launch FP8 attention values", error);
 }
 
 Status LaunchScale(float* values, const std::uint16_t* scalar_bf16,

@@ -51,6 +51,10 @@ def validate_result(document: dict[str, Any], expected: list[int]) -> None:
         raise ValidationError("inference did not consume the source layout directly")
     if document.get("token_loop_allocations") is not False:
         raise ValidationError("inference reported token-loop allocations")
+    if document.get("kv_cache_mode") != "checkpoint_fp8":
+        raise ValidationError("inference did not use checkpoint FP8 K/V semantics")
+    if document.get("kv_cache_storage") != "uint8_e4m3fn":
+        raise ValidationError("inference did not use physical FP8 K/V storage")
     if document.get("output_token_ids") != expected:
         raise ValidationError(
             f"greedy tokens differ: expected {expected}, got {document.get('output_token_ids')}"

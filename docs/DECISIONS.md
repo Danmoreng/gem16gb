@@ -1,5 +1,26 @@
 # Decisions
 
+## 2026-07-24: Match checkpoint FP8 K/V semantics by default and label BF16 explicitly
+
+Date: 2026-07-24
+Decision: When the checkpoint declares its static FP8 K/V scheme and per-layer scales, apply those E4M3
+quantize/dequantize semantics by default and store each cached value as one physical E4M3FN byte. Retain
+`--kv-cache bf16` as an explicit correctness mode. Label the routes and physical storage in every inference result,
+and reject the initial unfused cache kernels as benchmark evidence.
+Context: The first sky-prompt divergence was deterministic under greedy decoding: vLLM and llama.cpp selected token
+`563`, while the original BF16-cache engine selected `7412`. Layerwise prompt-derived dumps found exact V before
+the cache but a difference in the first attention context after cache reuse.
+Alternatives: Treat the token difference as an acceptable low-precision variation; force every reference to BF16;
+claim that float storage containing dequantized FP8 values is a production FP8 cache.
+Consequences: Normal chat follows the checkpoint. BF16 remains useful for isolating operator error, but results
+from different cache modes must never be presented as parity comparisons.
+The one-byte cache gives valid allocator accounting; optimized cache/attention kernels remain required for
+performance qualification.
+Evidence: Explicit BF16 vLLM and gem16gb both generate `[818,7217,7412]`. The current physical-FP8 gem16gb path
+also generates `[818,7217,7412]`, while FP8-vLLM and llama.cpp generate `[818,7217,563]`; the FP8 attention
+difference remains open. At context 64 the physical FP8 allocation is 11,010,048 bytes versus 44,040,192 bytes for
+the float32 BF16-semantics diagnostic cache.
+
 ## 2026-07-24: Expose checkpoint chat semantics through a native C++ boundary
 
 Date: 2026-07-24
@@ -30,10 +51,11 @@ diverge, as expected from autoregressive sensitivity.
 Alternatives: Require exact token equality indefinitely; accept any coherent-looking text; select one runtime as
 infallible.
 Consequences: Product correctness is based on operator contracts, distribution metrics, generation stability, and
-task quality. Our sky-prompt divergence at step 2 remains blocking evidence because both references select the same
-alternative with a meaningful margin; no tolerance is invented merely to accept it.
-Evidence: llama.cpp matches 50/65 current reference tokens, including 18 initial sky tokens and 28/32 thinking
-tokens. At engine sky step 2, both references choose `563`, while the engine promotes their rank-2 `7412`.
+task quality. Early disagreement still blocks acceptance until configuration differences are excluded; tolerances
+are not invented merely to accept it.
+Evidence: The sky step-2 disagreement was investigated rather than waived. FP8-versus-BF16 K/V semantics determine
+vLLM's result, but the current precision-matched FP8 gem16gb path still differs and remains an active correctness
+gate.
 
 ## 2026-07-23: Qualify unfused full-layer composition before fusion
 

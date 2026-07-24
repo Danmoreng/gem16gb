@@ -41,6 +41,9 @@ void PrintUsage() {
       << "              [--stop-token-ids <id,id,...>]\n"
       << "              [--suppress-token-ids <id,id,...>]\n"
       << "              [--dump-logits <raw-f32-path>]\n"
+      << "              [--dump-state <path> --dump-state-position N]\n"
+      << "              [--projection-path native|reference]\n"
+      << "              [--kv-cache fp8|bf16]\n"
       << "              [--max-tokens N] [--max-context N] --greedy\n"
       << "\nThe inference path is a correctness characterization and is not benchmark-qualified.\n";
 }
@@ -90,6 +93,35 @@ int main(int argc, char** argv) {
       }
     } else if (argument == "--dump-logits" && index + 1 < argc) {
       options.logits_dump_path = argv[++index];
+    } else if (argument == "--dump-state" && index + 1 < argc) {
+      options.state_dump_path = argv[++index];
+    } else if (argument == "--dump-state-position" && index + 1 < argc) {
+      std::uint64_t position = 0;
+      if (!ParseUnsigned(argv[++index], position)) {
+        std::cerr << "error: --dump-state-position must be an unsigned integer\n";
+        return 64;
+      }
+      options.state_dump_position = position;
+    } else if (argument == "--projection-path" && index + 1 < argc) {
+      const std::string_view path = argv[++index];
+      if (path == "native") {
+        options.projection_path = gem16gb::ProjectionPath::kNativeSm120;
+      } else if (path == "reference") {
+        options.projection_path = gem16gb::ProjectionPath::kCudaReference;
+      } else {
+        std::cerr << "error: --projection-path must be native or reference\n";
+        return 64;
+      }
+    } else if (argument == "--kv-cache" && index + 1 < argc) {
+      const std::string_view mode = argv[++index];
+      if (mode == "fp8") {
+        options.kv_cache_mode = gem16gb::KvCacheMode::kCheckpointFp8;
+      } else if (mode == "bf16") {
+        options.kv_cache_mode = gem16gb::KvCacheMode::kBf16Correctness;
+      } else {
+        std::cerr << "error: --kv-cache must be fp8 or bf16\n";
+        return 64;
+      }
     } else if (argument == "--greedy") {
       greedy = true;
     } else {
